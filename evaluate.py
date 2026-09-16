@@ -22,11 +22,11 @@ from sklearn.metrics import roc_curve
 
 from config import (
     DEVICE, IMAGE_SIZE, EPOCHS,
-    TAU_POS, TAU_NEG, LAMBDA_1, LAMBDA_2,
+    TAU_POS, TAU_NEG, LAMBDA_1, LAMBDA_2,TNR_TARGET,
 )
 from utils import (
     set_seed, compute_mde_metrics, compute_ood_metrics,
-    measure_inference_time_gpu,
+    measure_inference_time_gpu, calibrate_threshold, compute_binary_ood_metrics,
 )
 from data import get_dataloaders
 from network import FastDepthMDE, ForwardHookHandler, CORESScorer
@@ -118,82 +118,40 @@ def _get_target_layers(model: FastDepthMDE) -> dict:
 # ===========================================================================
 # Valutazione OOD con CORES
 # ===========================================================================
-
-def evaluate_cores_ood(
-    model: torch.nn.Module,
-    id_test_loader: DataLoader,
-    ood_test_loader: DataLoader,
-) -> dict:
-    """
-    Valuta OOD detection usando CORES sui layer encoder + decoder.
-
-    Returns:
-        dict con chiavi: auroc, fpr95, id_scores, ood_scores
-    """
-    model.eval()
-    model.to(DEVICE)
-
-    target_layers = _get_target_layers(model)
-    hook_handler  = ForwardHookHandler()
-    hook_handler.register(model, target_layers)
-
-    scorer = CORESScorer(
-        tau_pos=TAU_POS, tau_neg=TAU_NEG,
-        lambda_1=LAMBDA_1, lambda_2=LAMBDA_2,
-    )
-
-    # --- Score ID ---
-    id_scores_list = []
+def _collect_cores_scores(model, loader, scorer, hook_handler) -> np.ndarray:
+    scores = []
     with torch.no_grad():
-        for rgb, _ in id_test_loader:
+        for rgb, _ in loader:
             rgb = rgb.to(DEVICE)
             hook_handler.clear()
             _ = model(rgb)
-            features = hook_handler.get_features()
-            batch_scores = scorer.compute_score_per_sample(
-                features, batch_size=rgb.size(0),
-            )
-            id_scores_list.append(batch_scores)
+            scores.append(scorer.compute_score_per_sample(
+                hook_handler.get_features(), batch_size=rgb.size(0)))
+    return np.concatenate(scores)
 
-    id_scores = np.concatenate(id_scores_list)
+def evaluate_cores_ood(model, id_val_loader, id_test_loader, ood_test_loader) -> dict:
+    model.eval().to(DEVICE)
+    hook_handler = ForwardHookHandler()
+    hook_handler.register(model, _get_target_layers(model))
+    scorer = CORESScorer(tau_pos=TAU_POS, tau_neg=TAU_NEG,
+                         lambda_1=LAMBDA_1, lambda_2=LAMBDA_2)
 
-    # --- Score OOD ---
-    ood_scores_list = []
-    with torch.no_grad():
-        for rgb, _ in ood_test_loader:
-            rgb = rgb.to(DEVICE)
-            hook_handler.clear()
-            _ = model(rgb)
-            features = hook_handler.get_features()
-            batch_scores = scorer.compute_score_per_sample(
-                features, batch_size=rgb.size(0),
-            )
-            ood_scores_list.append(batch_scores)
-
-    ood_scores = np.concatenate(ood_scores_list)
-
+    val_scores = _collect_cores_scores(model, id_val_loader,  scorer, hook_handler)
+    id_scores  = _collect_cores_scores(model, id_test_loader, scorer, hook_handler)
+    ood_scores = _collect_cores_scores(model, ood_test_loader, scorer, hook_handler)
     hook_handler.remove()
 
-    # Calcolo metriche OOD
-    ood_metrics = compute_ood_metrics(id_scores, ood_scores)
+    ood_metrics = compute_ood_metrics(id_scores, ood_scores)      # threshold-free
+    threshold   = calibrate_threshold(val_scores, TNR_TARGET)     # solo su ID val
+    binary      = compute_binary_ood_metrics(id_scores, ood_scores, threshold)
 
-    print(f"\n{'='*60}")
-    print("  OOD Detection — CORES (Encoder + Decoder)")
-    print(f"{'='*60}")
-    print(f"  AUROC  : {ood_metrics['auroc']:.4f}")
-    print(f"  FPR95  : {ood_metrics['fpr95']:.4f}")
-    print(f"  ID  scores — mean: {id_scores.mean():.4f}, "
-          f"std: {id_scores.std():.4f}")
-    print(f"  OOD scores — mean: {ood_scores.mean():.4f}, "
-          f"std: {ood_scores.std():.4f}")
-    print(f"{'='*60}\n")
+    print(f"  Threshold (q{TNR_TARGET:.2f} su ID-val, n={len(val_scores)}): {threshold:.4f}")
+    print(f"  Accuracy {binary['accuracy']:.4f} | Precision {binary['precision']:.4f} | "
+          f"Recall {binary['recall']:.4f} | F1 {binary['f1']:.4f}")
+    print(f"  TNR su ID-test: {binary['tnr_test']:.4f}  (atteso ≈ {TNR_TARGET:.2f})")
 
-    return {
-        "auroc":      ood_metrics["auroc"],
-        "fpr95":      ood_metrics["fpr95"],
-        "id_scores":  id_scores,
-        "ood_scores": ood_scores,
-    }
+    return {**ood_metrics, "id_scores": id_scores, "ood_scores": ood_scores,
+            "val_scores": val_scores, "threshold": threshold, "binary": binary}
 
 
 # ===========================================================================
@@ -207,6 +165,8 @@ def _plot_results(epoch_losses: list, ood_result: dict,
 
     # --- Training loss ---
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+    ax.axvline(ood_result["threshold"], color="black", linestyle="--", linewidth=2,
+               label=f"Soglia (TNR95 val) = {ood_result['threshold']:.3f}")
     ax.plot(range(1, len(epoch_losses) + 1), epoch_losses,
             marker="o", linewidth=2, color="#2196F3")
     ax.set_xlabel("Epoch", fontsize=12)
@@ -285,7 +245,7 @@ def run_full_experiment() -> None:
 
     # 1. Dati
     print("\n[1/7] Building data loaders ...")
-    train_loader, id_test_loader, ood_test_loader = get_dataloaders()
+    train_loader, id_val_loader, id_test_loader, ood_test_loader = get_dataloaders()
 
     # 2. Modello
     print("[2/7] Instantiating FastDepth ...")
@@ -310,7 +270,7 @@ def run_full_experiment() -> None:
 
     # 6. OOD Detection
     print("[6/7] Evaluating CORES OOD detection ...")
-    ood_result = evaluate_cores_ood(model, id_test_loader, ood_test_loader)
+    ood_result = evaluate_cores_ood(model, id_val_loader, id_test_loader, ood_test_loader)
 
     # 7. Ablation study CORES
     print("[7/7] Running CORES ablation study ...")
@@ -319,8 +279,8 @@ def run_full_experiment() -> None:
     )
 
     # 8. Grafici
-    _plot_results(epoch_losses, ood_result)
-
+    _plot_results(epoch_losses, ood_result )
+    
     # --- Riepilogo ---
     print(f"\n{'='*60}")
     print("  EXPERIMENT SUMMARY")
@@ -336,3 +296,4 @@ def run_full_experiment() -> None:
     print(f"  AUROC          : {ood_result['auroc']:.4f}")
     print(f"  FPR95          : {ood_result['fpr95']:.4f}")
     print(f"{'='*60}\n")
+    

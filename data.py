@@ -12,10 +12,10 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader ,Subset          
 import torchvision.transforms as transforms
 
-from config import IMAGE_SIZE, BATCH_SIZE, NUM_WORKERS
+from config import IMAGE_SIZE, BATCH_SIZE, NUM_WORKERS, VAL_SPLIT
 
 
 # ===========================================================================
@@ -193,6 +193,29 @@ class KITTIOODDataset(Dataset):
 # DataLoader factory
 # ===========================================================================
 
+def _warn_if_synthetic(train_full: Dataset, test_ds: Dataset, ood_ds: Dataset) -> None:
+    """Avvisa esplicitamente se uno o più dataset stanno usando il fallback
+    sintetico: le distribuzioni sintetiche ID/OOD sono banalmente separabili,
+    quindi AUROC/FPR95 risultanti sono un sanity check della pipeline, non
+    un risultato di OOD detection reale."""
+    synthetic = [name for name, ds in (
+        ("NYU train", train_full),
+        ("NYU test",  test_ds),
+        ("KITTI OOD", ood_ds),
+    ) if not ds.real_data]
+
+    if synthetic:
+        print(f"\n{'!'*60}")
+        print("  WARNING: synthetic-data fallback attivo per: "
+              f"{', '.join(synthetic)}")
+        print("  Dati reali non trovati sotto ./data/... — verranno usati")
+        print("  placeholder generati casualmente. Le metriche OOD "
+              "(AUROC/FPR95) risulteranno")
+        print("  quasi perfette e NON costituiscono un risultato di OOD "
+              "detection significativo.")
+        print(f"{'!'*60}\n")
+
+
 def get_dataloaders(
     nyu_root:    str = "./data/nyu_depth_v2",
     kitti_root:  str = "./data/kitti_ood",
@@ -202,12 +225,17 @@ def get_dataloaders(
 ) -> tuple:
     """
     Costruisce e restituisce i DataLoader per:
-        - train  (NYU Depth V2, ID)
-        - test   (NYU Depth V2, ID)
-        - ood    (KITTI, OOD)
+        - train    (NYU Depth V2, ID)
+        - id_val   (NYU Depth V2, ID — split di calibrazione soglia OOD)
+        - test     (NYU Depth V2, ID)
+        - ood      (KITTI, OOD)
+
+    Se i dati reali non sono presenti su disco, ciascun dataset ricade su
+    un fallback sintetico (vedi NYUDepthV2Dataset/KITTIOODDataset); in tal
+    caso viene stampato un avviso esplicito (_warn_if_synthetic).
 
     Returns:
-        (train_loader, id_test_loader, ood_test_loader)
+        (train_loader, id_val_loader, id_test_loader, ood_test_loader)
     """
     # Normalizzazione ImageNet per l'encoder pre-addestrato
     img_transform = transforms.Normalize(
@@ -215,11 +243,19 @@ def get_dataloaders(
         std=[0.229, 0.224, 0.225],
     )
 
-    train_ds = NYUDepthV2Dataset(
+    train_full = NYUDepthV2Dataset(
         root=nyu_root, split="train",
-        num_samples=nyu_train_n,
-        transform=img_transform,
+        num_samples=nyu_train_n, transform=img_transform,
     )
+
+    # Split ID train / ID val — DISGIUNTI e deterministici.
+    n_total = len(train_full)
+    n_val   = int(round(VAL_SPLIT * n_total))
+    perm    = torch.randperm(n_total, generator=torch.Generator().manual_seed(42)).tolist()
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+
+    train_ds  = Subset(train_full, train_idx)
+    id_val_ds = Subset(train_full, val_idx)
     test_ds = NYUDepthV2Dataset(
         root=nyu_root, split="test",
         num_samples=nyu_test_n,
@@ -230,6 +266,8 @@ def get_dataloaders(
         num_samples=kitti_ood_n,
         transform=img_transform,
     )
+
+    _warn_if_synthetic(train_full, test_ds, ood_ds)
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE,
@@ -246,5 +284,9 @@ def get_dataloaders(
         shuffle=False, num_workers=NUM_WORKERS,
         pin_memory=True,
     )
+    id_val_loader = DataLoader(
+        id_val_ds, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=NUM_WORKERS, pin_memory=True,
+    )
 
-    return train_loader, id_test_loader, ood_test_loader
+    return train_loader, id_val_loader, id_test_loader, ood_test_loader
