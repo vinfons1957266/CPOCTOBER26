@@ -28,7 +28,9 @@ from config import (
     DEVICE, TAU_POS, TAU_NEG, LAMBDA_1, LAMBDA_2,
 )
 from utils import compute_ood_metrics
-from network import FastDepthMDE, ForwardHookHandler, CORESScorer
+from network import (
+    FastDepthMDE, ForwardHookHandler, CORESScorer, cores_response_components,
+)
 
 
 # ===========================================================================
@@ -65,19 +67,25 @@ def _collect_scores(
 
 
 def _all_target_layers(model: FastDepthMDE) -> OrderedDict:
-    """Restituisce tutti gli 11 layer monitorabili (6 enc + 5 dec), ordinati."""
+    """
+    Restituisce tutti gli 11 layer monitorabili (6 enc + 5 dec), ordinati.
+
+    Tap pre-attivazione (BatchNorm prima della ReLU) — deve restare
+    sincronizzato con evaluate.py::_get_target_layers(). Vedi lì per il
+    motivo (RM-/RF- sarebbero sempre nulli su un tap post-ReLU).
+    """
     layers = OrderedDict()
-    layers["enc_stage0"] = model.encoder.stage0
-    layers["enc_stage1"] = model.encoder.stage1
-    layers["enc_stage2"] = model.encoder.stage2
-    layers["enc_stage3"] = model.encoder.stage3
-    layers["enc_stage4"] = model.encoder.stage4
-    layers["enc_stage5"] = model.encoder.stage5
-    layers["dec_up1"]    = model.decoder.up1
-    layers["dec_up2"]    = model.decoder.up2
-    layers["dec_up3"]    = model.decoder.up3
-    layers["dec_up4"]    = model.decoder.up4
-    layers["dec_up5"]    = model.decoder.up5
+    layers["enc_stage0"] = model.encoder.stage0[1]
+    layers["enc_stage1"] = model.encoder.stage1.bn_pw
+    layers["enc_stage2"] = model.encoder.stage2[-1].bn_pw
+    layers["enc_stage3"] = model.encoder.stage3[-1].bn_pw
+    layers["enc_stage4"] = model.encoder.stage4[-1].bn_pw
+    layers["enc_stage5"] = model.encoder.stage5[-1].bn_pw
+    layers["dec_up1"]    = model.decoder.up1.conv.bn_pw
+    layers["dec_up2"]    = model.decoder.up2.conv.bn_pw
+    layers["dec_up3"]    = model.decoder.up3.conv.bn_pw
+    layers["dec_up4"]    = model.decoder.up4.conv.bn_pw
+    layers["dec_up5"]    = model.decoder.up5.conv.bn_pw
     return layers
 
 
@@ -290,7 +298,12 @@ def cores_detailed_statistics(
     handler.register(model, all_layers)
 
     def _extract_components(loader):
-        """Raccoglie RM+/RM-/RF+/RF- per-layer come medie sul dataset."""
+        """Raccoglie RM+/RM-/RF+/RF- per-layer come medie sul dataset.
+
+        Usa la stessa cores_response_components() di CORESScorer (estremi
+        spaziali per canale, Eq. 3/4), cosi' queste statistiche diagnostiche
+        restano coerenti con lo score effettivamente usato in produzione.
+        """
         layer_stats = {name: {"rm_pos": [], "rm_neg": [],
                               "rf_pos": [], "rf_neg": []}
                        for name in all_layers}
@@ -303,30 +316,13 @@ def cores_detailed_statistics(
                 features = handler.get_features()
 
                 for name, feat in features.items():
-                    if feat.dim() == 3:
-                        feat = feat.unsqueeze(0)
+                    rm_p, rm_n, rf_p, rf_n = cores_response_components(
+                        feat.cpu(), TAU_POS, TAU_NEG)
 
-                    flat = feat.view(feat.size(0), -1).float().cpu()
-                    n = flat.size(1)
-
-                    pos_mask = flat > TAU_POS
-                    neg_mask = flat < TAU_NEG
-
-                    pos_vals = flat * pos_mask.float()
-                    rm_p = (pos_vals.sum(dim=1) /
-                            (pos_mask.sum(dim=1).float() + 1e-8)).mean().item()
-
-                    neg_vals = flat.abs() * neg_mask.float()
-                    rm_n = (neg_vals.sum(dim=1) /
-                            (neg_mask.sum(dim=1).float() + 1e-8)).mean().item()
-
-                    rf_p = (pos_mask.float().sum(dim=1) / n).mean().item()
-                    rf_n = (neg_mask.float().sum(dim=1) / n).mean().item()
-
-                    layer_stats[name]["rm_pos"].append(rm_p)
-                    layer_stats[name]["rm_neg"].append(rm_n)
-                    layer_stats[name]["rf_pos"].append(rf_p)
-                    layer_stats[name]["rf_neg"].append(rf_n)
+                    layer_stats[name]["rm_pos"].append(rm_p.mean().item())
+                    layer_stats[name]["rm_neg"].append(rm_n.mean().item())
+                    layer_stats[name]["rf_pos"].append(rf_p.mean().item())
+                    layer_stats[name]["rf_neg"].append(rf_n.mean().item())
 
         # Media su tutti i batch
         for name in layer_stats:

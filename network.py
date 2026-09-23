@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 
-from config import LAMBDA_1, LAMBDA_2, TAU_POS, TAU_NEG
+from config import LAMBDA_1, LAMBDA_2, TAU_POS, TAU_NEG, CORES_EPS
 
 
 # ===========================================================================
@@ -51,8 +51,13 @@ class DepthwiseSeparableConv(nn.Module):
         self.bn_pw = nn.BatchNorm2d(out_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.bn_dw(self.depthwise(x)), inplace=True)
-        x = F.relu(self.bn_pw(self.pointwise(x)), inplace=True)
+        # inplace=False: CORES aggancia forward hook su bn_dw/bn_pw per
+        # leggere la risposta PRIMA della ReLU. Un ReLU in-place sovrascrive
+        # il buffer condiviso dal tensore già catturato dall'hook (anche se
+        # .detach()'d, condivide lo storage), azzerando ogni valore negativo
+        # che l'hook avrebbe dovuto osservare.
+        x = F.relu(self.bn_dw(self.depthwise(x)), inplace=False)
+        x = F.relu(self.bn_pw(self.pointwise(x)), inplace=False)
         return x
 
 
@@ -117,7 +122,7 @@ class MobileNetV1Encoder(nn.Module):
         self.stage0 = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),  # inplace=False: vedi nota in DepthwiseSeparableConv
         )
 
         # Stage 1: 32 → 64  (stride=1)  → 1/2
@@ -326,6 +331,51 @@ class ForwardHookHandler:
 
 
 # ===========================================================================
+# CORES — componenti di risposta condivise (Eq. 3/4, Tang et al.)
+# ===========================================================================
+
+def cores_response_components(feat: torch.Tensor, tau_pos: float,
+                               tau_neg: float):
+    """
+    Calcola RM+/RM-/RF+/RF- secondo le Eq. (3)/(4) del paper CORES, usando
+    gli ESTREMI SPAZIALI PER CANALE — non il tensore appiattito.
+
+    Nel paper, la "risposta" di un kernel R_c è la sua mappa spaziale
+    (H, W); CORES usa solo il picco max(R_c) e il minimo min(R_c) di
+    ciascun canale (non ogni singolo pixel), poi media su c = 1:C canali:
+        RM+ = media_c[ max( max(R_c) - tau_pos, 0 ) ]
+        RM- = media_c[ max( tau_neg - min(R_c), 0 ) ]
+        RF+ = frazione di canali con max(R_c) > tau_pos
+        RF- = frazione di canali con min(R_c) < tau_neg
+
+    Usata sia da CORESScorer (per lo score aggregato) sia da
+    ablation.py::cores_detailed_statistics (per le statistiche separate),
+    cosi' che le due implementazioni non possano divergere.
+
+    Args:
+        feat: (B, C, H, W) o (C, H, W) — feature map pre-attivazione di un
+              layer monitorato (vedi evaluate.py::_get_target_layers).
+        tau_pos, tau_neg: soglie di significatività della risposta.
+
+    Returns:
+        Tupla (rm_pos, rm_neg, rf_pos, rf_neg), ciascuno Tensor di forma (B,).
+    """
+    if feat.dim() == 3:
+        feat = feat.unsqueeze(0)
+    feat = feat.float()
+
+    peak   = feat.amax(dim=(2, 3))   # (B, C) — max(R_c) per ogni canale
+    trough = feat.amin(dim=(2, 3))   # (B, C) — min(R_c) per ogni canale
+
+    rm_pos = (peak - tau_pos).clamp(min=0).mean(dim=1)
+    rm_neg = (tau_neg - trough).clamp(min=0).mean(dim=1)
+    rf_pos = (peak > tau_pos).float().mean(dim=1)
+    rf_neg = (trough < tau_neg).float().mean(dim=1)
+
+    return rm_pos, rm_neg, rf_pos, rf_neg
+
+
+# ===========================================================================
 # CORES Scorer
 # ===========================================================================
 
@@ -333,19 +383,28 @@ class CORESScorer:
     """
     Convolutional Response-based OOD Scoring (CORES).
 
-    Per ogni layer monitorato l, calcola:
-        RM_l^+ = media delle attivazioni > tau_pos   (Response Magnitude positiva)
-        RM_l^- = media di |attivazioni| dove act < tau_neg (RM negativa)
-        RF_l^+ = frazione di attivazioni > tau_pos   (Response Frequency positiva)
-        RF_l^- = frazione di attivazioni < tau_neg   (RF negativa)
+    Per ogni layer monitorato l, calcola (vedi cores_response_components,
+    Eq. 3/4 del paper):
+        RM_l^+ = media_c[ max(max(R_c) - tau_pos, 0) ]  (Response Magnitude positiva)
+        RM_l^- = media_c[ max(tau_neg - min(R_c), 0) ]  (RM negativa)
+        RF_l^+ = frazione di canali con max(R_c) > tau_pos  (Response Frequency positiva)
+        RF_l^- = frazione di canali con min(R_c) < tau_neg  (RF negativa)
 
-    Score per layer:
-        S_l = λ₁ · (RM_l^+ + RM_l^-) + λ₂ · (RF_l^+ + RF_l^-)
+    Score per layer (Eq. 5/9 del paper — prodotto, non somma pesata):
+        S_l = RM_l^+ ^ λ₁ · RM_l^- ^ λ₁ · RF_l^+ ^ λ₂ · RF_l^- ^ λ₂
+
+    Con λ₁=10 il prodotto va in underflow float32 (RM ~ 1e-2-1e-3 per campione
+    ID → S_l ~ 1e-20+). Si calcola quindi log(S_l), che e' una trasformazione
+    monotona equivalente ai fini di AUROC/FPR95/soglia:
+        log S_l = λ₁·(log(RM_l^+ + ε) + log(RM_l^- + ε))
+                + λ₂·(log(RF_l^+ + ε) + log(RF_l^- + ε))
 
     Score finale (su L layer):
-        S = (1/L) · Σ_l S_l
+        log S = (1/L) · Σ_l log S_l
 
-    Score più alto => più probabile che il campione sia OOD.
+    Convenzione del paper (Eq. 1): score più alto => più probabile ID, non
+    OOD (i kernel rispondono più intensamente a campioni ID). La direzione
+    usata da utils.py va allineata a questa convenzione (vedi piano, punto A5).
     """
 
     def __init__(
@@ -354,49 +413,36 @@ class CORESScorer:
         tau_neg:  float = TAU_NEG,
         lambda_1: float = LAMBDA_1,
         lambda_2: float = LAMBDA_2,
+        eps:      float = CORES_EPS,
     ):
         self.tau_pos  = tau_pos
         self.tau_neg  = tau_neg
         self.lambda_1 = lambda_1
         self.lambda_2 = lambda_2
+        self.eps      = eps
 
     def compute_layer_score(self, feat: torch.Tensor) -> float:
         """
-        Calcola lo score CORES per un singolo feature map.
+        Calcola lo score CORES (in log-spazio, Eq. 5/9) per un singolo
+        feature map.
 
         Args:
             feat: (B, C, H, W) o (C, H, W) feature map da un layer.
 
         Returns:
-            Score scalare per questo layer (media sul batch).
+            log-score scalare per questo layer (media sul batch).
         """
-        if feat.dim() == 3:
-            feat = feat.unsqueeze(0)
+        rm_pos, rm_neg, rf_pos, rf_neg = cores_response_components(
+            feat, self.tau_pos, self.tau_neg)
 
-        # Flatten spaziale + canali per campione  → (B, C*H*W)
-        flat = feat.view(feat.size(0), -1).float()
-        n = flat.size(1)
+        # log(S) per campione — prodotto di Eq. 5/9 in log-spazio (vedi
+        # docstring della classe per la derivazione e la motivazione)
+        log_score = (
+            self.lambda_1 * (torch.log(rm_pos + self.eps) + torch.log(rm_neg + self.eps))
+            + self.lambda_2 * (torch.log(rf_pos + self.eps) + torch.log(rf_neg + self.eps))
+        )
 
-        pos_mask = flat > self.tau_pos
-        neg_mask = flat < self.tau_neg
-
-        # RM+: magnitudine media delle attivazioni positive
-        pos_vals = flat * pos_mask.float()
-        rm_pos = pos_vals.sum(dim=1) / (pos_mask.sum(dim=1).float() + 1e-8)
-
-        # RM-: magnitudine media delle |attivazioni negative|
-        neg_vals = flat.abs() * neg_mask.float()
-        rm_neg = neg_vals.sum(dim=1) / (neg_mask.sum(dim=1).float() + 1e-8)
-
-        # RF+, RF-: frazioni
-        rf_pos = pos_mask.float().sum(dim=1) / n
-        rf_neg = neg_mask.float().sum(dim=1) / n
-
-        # Score per campione
-        score = (self.lambda_1 * (rm_pos + rm_neg)
-                 + self.lambda_2 * (rf_pos + rf_neg))
-
-        return score.mean().item()
+        return log_score.mean().item()
 
     def compute_score(self, features: dict) -> float:
         """
@@ -406,7 +452,7 @@ class CORESScorer:
             features: dict[nome_layer] → Tensor (B, C, H, W)
 
         Returns:
-            Media degli score per-layer (scalare).
+            Media dei log-score per-layer (scalare).
         """
         if len(features) == 0:
             return 0.0
@@ -418,14 +464,14 @@ class CORESScorer:
     def compute_score_per_sample(self, features: dict,
                                   batch_size: int) -> np.ndarray:
         """
-        Calcola gli score CORES per-campione (per costruire array di score).
+        Calcola gli score CORES (log-spazio, Eq. 5/9) per-campione.
 
         Args:
             features:   dict[nome_layer] → Tensor (B, C, H, W)
             batch_size: B
 
         Returns:
-            np.ndarray di forma (B,) con gli score per campione.
+            np.ndarray di forma (B,) con i log-score per campione.
         """
         if len(features) == 0:
             return np.zeros(batch_size)
@@ -433,28 +479,318 @@ class CORESScorer:
         per_sample = torch.zeros(batch_size, device="cpu")
 
         for feat in features.values():
-            if feat.dim() == 3:
-                feat = feat.unsqueeze(0)
+            rm_pos, rm_neg, rf_pos, rf_neg = cores_response_components(
+                feat.cpu(), self.tau_pos, self.tau_neg)
 
-            flat = feat.view(feat.size(0), -1).float().cpu()
-            n = flat.size(1)
+            log_score = (
+                self.lambda_1 * (torch.log(rm_pos + self.eps) + torch.log(rm_neg + self.eps))
+                + self.lambda_2 * (torch.log(rf_pos + self.eps) + torch.log(rf_neg + self.eps))
+            )
 
-            pos_mask = flat > self.tau_pos
-            neg_mask = flat < self.tau_neg
-
-            pos_vals = flat * pos_mask.float()
-            rm_pos = pos_vals.sum(dim=1) / (pos_mask.sum(dim=1).float() + 1e-8)
-
-            neg_vals = flat.abs() * neg_mask.float()
-            rm_neg = neg_vals.sum(dim=1) / (neg_mask.sum(dim=1).float() + 1e-8)
-
-            rf_pos = pos_mask.float().sum(dim=1) / n
-            rf_neg = neg_mask.float().sum(dim=1) / n
-
-            score = (self.lambda_1 * (rm_pos + rm_neg)
-                     + self.lambda_2 * (rf_pos + rf_neg))
-
-            per_sample += score
+            per_sample += log_score
 
         per_sample /= len(features)
         return per_sample.numpy()
+
+    @staticmethod
+    def _gather_channels(feat: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Estrae, per ciascun campione, il sottoinsieme di canali indicato da
+        `indices` (B, k) dal feature map `feat` (B, C, H, W).
+
+        Args:
+            feat:    (B, C, H, W)
+            indices: (B, k) — indici di canale, PER CAMPIONE.
+
+        Returns:
+            Tensor (B, k, H, W).
+        """
+        b, k = indices.shape
+        _, _, h, w = feat.shape
+        idx = indices.view(b, k, 1, 1).expand(-1, -1, h, w)
+        return feat.gather(1, idx)
+
+    def compute_score_per_sample_selected(self, features: dict,
+                                          selections: dict,
+                                          batch_size: int) -> np.ndarray:
+        """
+        Calcola gli score CORES (Eq. 9, CON selezione dei kernel
+        sample-relevant, Sez. 4.2) per-campione.
+
+        A differenza di compute_score_per_sample (che usa TUTTI i canali
+        di ogni layer, Eq. 5), qui RM+/RF+ sono calcolati SOLO sul
+        sottoinsieme di canali I_pos, e RM-/RF- SOLO sul sottoinsieme
+        I_neg:
+            S(R̄∪R̲) = RM+(R̄)^λ1 · RM-(R̲)^λ1 · RF+(R̄)^λ2 · RF-(R̲)^λ2
+        (in log-spazio, come compute_score_per_sample — vedi Eq. 9 e la
+        nota sull'underflow nella docstring di classe).
+
+        I due sottoinsiemi NON sono necessariamente disgiunti (vedi
+        CORESKernelSelector.backtrack) — nessun vincolo di esclusività è
+        imposto dal paper tra R̄ e R̲.
+
+        Args:
+            features:   dict[nome_layer] → Tensor (B, C, H, W) — le stesse
+                        feature map tappate usate da compute_score_per_sample.
+                        Può contenere layer extra (es. l'output grezzo di
+                        final_conv, usato solo per la selezione iniziale)
+                        che non compaiono in `selections`: vengono ignorati.
+            selections: dict[nome_layer] → (I_pos, I_neg), da
+                        CORESKernelSelector.backtrack() — LongTensor (B, k)
+                        ciascuno (k varia per layer).
+            batch_size: B
+
+        Returns:
+            np.ndarray di forma (B,) con i log-score per campione.
+        """
+        if len(selections) == 0:
+            return np.zeros(batch_size)
+
+        per_sample = torch.zeros(batch_size, device="cpu")
+        n_layers = 0
+
+        for name, feat in features.items():
+            if name not in selections:
+                continue
+
+            i_pos, i_neg = selections[name]
+            feat = feat.cpu()
+
+            feat_pos = self._gather_channels(feat, i_pos.cpu())  # (B, k_pos, H, W)
+            feat_neg = self._gather_channels(feat, i_neg.cpu())  # (B, k_neg, H, W)
+
+            rm_pos, _, rf_pos, _ = cores_response_components(
+                feat_pos, self.tau_pos, self.tau_neg)
+            _, rm_neg, _, rf_neg = cores_response_components(
+                feat_neg, self.tau_pos, self.tau_neg)
+
+            log_score = (
+                self.lambda_1 * (torch.log(rm_pos + self.eps) + torch.log(rm_neg + self.eps))
+                + self.lambda_2 * (torch.log(rf_pos + self.eps) + torch.log(rf_neg + self.eps))
+            )
+
+            per_sample += log_score
+            n_layers += 1
+
+        if n_layers == 0:
+            return np.zeros(batch_size)
+
+        per_sample /= n_layers
+        return per_sample.numpy()
+
+
+# ===========================================================================
+# CORES Kernel Selector — selezione sample-relevant e backtracking (Sez. 4.2)
+# ===========================================================================
+
+class CORESKernelSelector:
+    """
+    Selezione dei kernel sample-relevant e backtracking attraverso i pesi
+    del decoder (Eq. 6-8 del paper CORES).
+
+    FastDepth non ha un layer fully-connected né categorie c_max/c_min —
+    è un regressore denso a singola uscita (o=1), non un classificatore —
+    quindi Eq. 6/8 vanno adattate:
+
+    - La traiettoria di backtracking (questa classe, B1 del piano) è
+      ristretta al SOLO decoder: 5 nodi (dec_up5..dec_up1), collegati da
+      4 pesi pointwise 1×1. Non si estende nell'encoder (vedi nota su
+      up1.conv.pointwise più sotto) né oltre dec_up1.
+    - La selezione al nodo iniziale (dec_up5, Eq. 6) e i passi di
+      backtracking veri e propri (Eq. 8) sono implementati separatamente
+      (vedi piano, punti B2/B3) — questa classe fornisce per ora solo
+      l'infrastruttura statica: la catena di pesi e il peso di
+      final_conv (l'analogo di F in Eq. 6).
+
+    I quattro nodi encoder-side non compaiono qui: le connessioni skip
+    additive del decoder (up1..up4) sono somme dirette non pesate, non
+    matrici K apprese — backtrackare attraverso di esse degenererebbe
+    in una selezione uniforme (ogni canale riceve lo stesso peso "1"),
+    quindi non porterebbero informazione utile a Eq. 8.
+    """
+
+    def __init__(self, model: FastDepthMDE):
+        self.final_conv_weight = self._to_2d(model.decoder.final_conv.weight)
+        self.chain = self._backtracking_chain(model)
+
+    @staticmethod
+    def _to_2d(weight: torch.Tensor) -> torch.Tensor:
+        """
+        (c_out, c_in, 1, 1) -> (c_out, c_in). I pesi pointwise (e
+        final_conv) sono sempre kernel 1×1: max/min sulla dimensione
+        spaziale (Eq. 8) coincidono quindi col valore stesso della matrice,
+        e la riduzione a 2D non perde informazione.
+        """
+        return weight.reshape(weight.shape[0], weight.shape[1])
+
+    @classmethod
+    def _backtracking_chain(cls, model: FastDepthMDE) -> list:
+        """
+        Costruisce la traiettoria di backtracking a 5 nodi / 4 hop
+        (dec_up5 -> dec_up4 -> dec_up3 -> dec_up2 -> dec_up1), SOLO
+        decoder — vedi Decisione 2 del piano.
+
+        Returns:
+            Lista ordinata di tuple (nome_nodo, peso_2D_o_None):
+                [("dec_up5", None),      # nodo iniziale: nessun hop; la
+                                          #   selezione qui usa final_conv
+                                          #   (Eq. 6, vedi B2 — non incluso
+                                          #   in questa classe per ora)
+                 ("dec_up4", W1),        # hop 1: dec_up5 -> dec_up4,
+                                          #   W1 = up5.conv.pointwise (32,64)
+                 ("dec_up3", W2),        # hop 2: dec_up4 -> dec_up3,
+                                          #   W2 = up4.conv.pointwise (64,128)
+                 ("dec_up2", W3),        # hop 3: dec_up3 -> dec_up2,
+                                          #   W3 = up3.conv.pointwise (128,256)
+                 ("dec_up1", W4)]        # hop 4: dec_up2 -> dec_up1,
+                                          #   W4 = up2.conv.pointwise (256,512)
+
+            Ogni peso W ha forma (c_out, c_in): c_out = canali del nodo
+            PRECEDENTE nella lista (quello "verso l'output"), c_in = canali
+            del nodo CORRENTE — la stessa convenzione di K in Eq. 8.
+
+            NOTA: up1.conv.pointwise.weight (512, 1024) NON compare in
+            questa catena. Servirebbe solo per proseguire il backtracking
+            OLTRE dec_up1, dentro l'encoder (il suo input è l'output finale
+            dell'encoder, s5/enc_stage5) — la Decisione 2 esclude
+            esplicitamente questa estensione.
+        """
+        return [
+            ("dec_up5", None),
+            ("dec_up4", cls._to_2d(model.decoder.up5.conv.pointwise.weight)),
+            ("dec_up3", cls._to_2d(model.decoder.up4.conv.pointwise.weight)),
+            ("dec_up2", cls._to_2d(model.decoder.up3.conv.pointwise.weight)),
+            ("dec_up1", cls._to_2d(model.decoder.up2.conv.pointwise.weight)),
+        ]
+
+    def select_initial_indices(self, raw_depth: torch.Tensor,
+                                feat_dec_up5: torch.Tensor, k: int):
+        """
+        Selezione al nodo iniziale (dec_up5), analogo di Eq. 6/7 per un
+        regressore denso a singola uscita (FastDepth: o=1, nessuna
+        categoria c_max/c_min su cui scegliere una riga di F).
+
+        Sostituzione riga -> pixel: il pixel dove la profondità PREDETTA
+        è più alta gioca il ruolo di c_max, quello dove è più bassa il
+        ruolo di c_min. Poiché final_conv è una conv 1×1, il valore
+        predetto in un pixel è esattamente Σⱼ F0[j]·x[j, pixel] — quindi
+        F0[j]·x[j, pixel] è il termine j-esimo di quella somma, e sostituisce
+        F_{c_max,j} come criterio di importanza per canale.
+
+        NOTA su TopK vs BotK: qui si usa TopK per ENTRAMBI i rami (come
+        Eq. 6, che usa TopK sia per c_max sia per c_min) — non l'asimmetria
+        TopK/BotK di Eq. 8, che si applica solo ai passi di backtracking
+        intermedi (vedi B3). Il prodotto F0·x è firmato, quindi TopK su di
+        esso premia sia (F0 grande positivo, x grande positivo) sia
+        (F0 grande negativo, x grande negativo): entrambi i casi spiegano
+        fortemente il valore osservato al pixel.
+
+        Args:
+            raw_depth:    (B, 1, H, W) — output GREZZO di final_conv, PRIMA
+                          della ReLU. model.forward() restituisce solo la
+                          versione già passata per ReLU: serve un hook
+                          dedicato su model.decoder.final_conv per ottenere
+                          questo tensore.
+            feat_dec_up5: (B, 32, H, W) — tap pre-attivazione di dec_up5
+                          (lo stesso già catturato dai target layer
+                          esistenti in evaluate.py/ablation.py).
+            k: numero di canali da selezionare (TopK), tipicamente
+               round(TOPK_FRAC * 32).
+
+        Returns:
+            (I_pos, I_neg): LongTensor (B, k) ciascuno — indici di canale
+            PER CAMPIONE (la selezione dipende dalla predizione, quindi
+            varia da campione a campione).
+        """
+        assert raw_depth.shape[2:] == feat_dec_up5.shape[2:], (
+            "raw_depth e feat_dec_up5 devono condividere la risoluzione "
+            "spaziale (entrambi 224x224 nell'architettura attuale)"
+        )
+
+        batch_size, num_channels = feat_dec_up5.shape[0], feat_dec_up5.shape[1]
+        k = max(1, min(k, num_channels))
+
+        f0 = self.final_conv_weight.detach().reshape(-1)  # (32,)
+
+        # Indice del pixel piu' lontano / piu' vicino nella predizione grezza
+        flat_depth = raw_depth.flatten(2)                          # (B, 1, HW)
+        idx_far  = flat_depth.argmax(dim=-1, keepdim=True).expand(
+            -1, num_channels, -1)                                  # (B, C, 1)
+        idx_near = flat_depth.argmin(dim=-1, keepdim=True).expand(
+            -1, num_channels, -1)                                  # (B, C, 1)
+
+        # Risposta di ciascun canale ESATTAMENTE in quei due pixel
+        flat_feat = feat_dec_up5.flatten(2)                        # (B, C, HW)
+        response_far  = flat_feat.gather(2, idx_far).squeeze(-1)   # (B, C)
+        response_near = flat_feat.gather(2, idx_near).squeeze(-1)  # (B, C)
+
+        # Contributo firmato di ciascun canale al valore predetto in quel
+        # pixel (esatto, poiche' final_conv e' una conv 1x1)
+        contrib_far  = f0.unsqueeze(0) * response_far              # (B, C)
+        contrib_near = f0.unsqueeze(0) * response_near             # (B, C)
+
+        i_pos = contrib_far.topk(k, dim=1).indices                 # (B, k)
+        i_neg = contrib_near.topk(k, dim=1).indices                # (B, k)
+
+        return i_pos, i_neg
+
+    def backtrack(self, initial_pos: torch.Tensor, initial_neg: torch.Tensor,
+                  topk_frac: float) -> dict:
+        """
+        Backtracking all'indietro lungo self.chain (Eq. 8 del paper CORES),
+        a partire dagli indici scelti al nodo iniziale dec_up5 (tipicamente
+        da select_initial_indices, B2).
+
+        Per i kernel pointwise 1x1 usati qui, max(K_{i,j,:,:}) =
+        min(K_{i,j,:,:}) = K_{i,j} (un solo valore, nessuna estensione
+        spaziale su cui prendere un estremo) — quindi l'Eq. 8 collassa a:
+            Ī^(l) = TopK( Σ_{i in Ī^(l+1)} W[i, j] )
+            I̲^(l) = BotK( Σ_{i in I̲^(l+1)} W[i, j] )
+        dove W e' il peso pointwise 2D che connette il layer l al layer
+        l+1 (vedi self.chain, B1). Con kernel 1x1 l'UNICA differenza tra
+        i due rami e' quale insieme di indici entra nella somma e se poi
+        si prende TopK o BotK del risultato — non un'estrazione max/min
+        diversa sul peso stesso (che qui e' un singolo scalare per i,j).
+
+        Nota: k viene ricalcolato ad OGNI hop come round(topk_frac * C_l),
+        C_l = canali del layer l — non e' lo stesso k del nodo iniziale,
+        perche' il numero di canali cresce risalendo la catena
+        (32->64->128->256->512).
+
+        Args:
+            initial_pos, initial_neg: LongTensor (B, k0) — indici scelti
+                al nodo iniziale (dec_up5), da select_initial_indices.
+            topk_frac: frazione di canali da selezionare ad ogni layer
+                (tipicamente TOPK_FRAC da config.py, es. 0.20).
+
+        Returns:
+            dict[nome_nodo] -> (I_pos, I_neg), per OGNI nodo della catena
+            (incluso quello iniziale, con gli indici passati in input
+            invariati). Ciascun I_pos/I_neg e' LongTensor (B, k_l), con
+            k_l che varia da nodo a nodo.
+        """
+        results = {}
+        current_pos, current_neg = initial_pos, initial_neg
+
+        for name, weight in self.chain:
+            if weight is None:
+                # Nodo iniziale (dec_up5): nessun hop, indici gia' forniti.
+                results[name] = (current_pos, current_neg)
+                continue
+
+            num_channels = weight.shape[1]
+            k = max(1, round(topk_frac * num_channels))
+
+            # Somma per-campione dei pesi delle righe selezionate al passo
+            # precedente (Eq. 8): weight[current_pos] usa indicizzazione
+            # avanzata di PyTorch, che con un indice (B, k) su una matrice
+            # (c_out, c_in) produce (B, k, c_in) senza bisogno di gather.
+            pos_scores = weight[current_pos].sum(dim=1)   # (B, c_in)
+            neg_scores = weight[current_neg].sum(dim=1)   # (B, c_in)
+
+            current_pos = pos_scores.topk(k, dim=1, largest=True).indices
+            current_neg = neg_scores.topk(k, dim=1, largest=False).indices
+
+            results[name] = (current_pos, current_neg)
+
+        return results

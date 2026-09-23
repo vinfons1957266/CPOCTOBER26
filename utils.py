@@ -87,12 +87,16 @@ def compute_ood_metrics(id_scores: np.ndarray, ood_scores: np.ndarray) -> dict:
     """
     Calcola AUROC e FPR@95%TPR per OOD detection.
 
-    Convenzione: score più alto => più probabile OOD.
-    Label:       ID = 0,  OOD = 1.
+    Convenzione CORES (Eq. 1 del paper, Tang et al.): score più alto =>
+    più probabile ID, non OOD — i kernel convoluzionali rispondono più
+    intensamente a campioni ID (vedi CORESScorer). scikit-learn assume
+    invece "score alto => classe positiva"; con label OOD=1 si usa quindi
+    -score come "OOD-ness" (score alto => ID => -score basso => corretto).
+    Label: ID = 0, OOD = 1 (la classe positiva resta OOD).
 
     Args:
-        id_scores:  array 1-D di score OOD per campioni in-distribution.
-        ood_scores: array 1-D di score OOD per campioni out-of-distribution.
+        id_scores:  array 1-D di score CORES per campioni in-distribution.
+        ood_scores: array 1-D di score CORES per campioni out-of-distribution.
 
     Returns:
         dict con chiavi: auroc, fpr95
@@ -101,12 +105,13 @@ def compute_ood_metrics(id_scores: np.ndarray, ood_scores: np.ndarray) -> dict:
         np.zeros(len(id_scores)),
         np.ones(len(ood_scores)),
     ])
-    scores = np.concatenate([id_scores, ood_scores])
+    # -score: "OOD-ness" crescente, coerente con la convenzione scikit-learn
+    ood_ness = np.concatenate([-id_scores, -ood_scores])
 
-    auroc = roc_auc_score(labels, scores)
+    auroc = roc_auc_score(labels, ood_ness)
 
     # FPR al 95 % TPR
-    fpr, tpr, _ = roc_curve(labels, scores)
+    fpr, tpr, _ = roc_curve(labels, ood_ness)
     idx   = np.searchsorted(tpr, 0.95)
     fpr95 = fpr[min(idx, len(fpr) - 1)]
 
@@ -116,20 +121,26 @@ def calibrate_threshold(val_id_scores: np.ndarray,
                         tnr_target: float = 0.95) -> float:
     """
     Stima la soglia ID/OOD SOLO su score ID di validazione.
-    Convenzione: score alto => OOD. Predizione: OOD se score > threshold.
-    Con tnr_target=0.95 il 95% dei campioni ID di validazione resta sotto soglia.
+    Convenzione CORES (Eq. 1): score alto => ID. Predizione: OOD se
+    score < threshold. Con tnr_target=0.95 si vuole che il 95% dei
+    campioni ID di validazione resti SOPRA soglia (classificato ID);
+    la soglia è quindi il quantile (1 - tnr_target) — non tnr_target —
+    degli score ID di validazione.
     """
-    return float(np.quantile(val_id_scores, tnr_target))
+    return float(np.quantile(val_id_scores, 1.0 - tnr_target))
 
 
 def compute_binary_ood_metrics(id_scores: np.ndarray,
                                ood_scores: np.ndarray,
                                threshold: float) -> dict:
-    """Metriche a soglia fissa. Positivo = OOD."""
-    tp = int((ood_scores >  threshold).sum())   # OOD rilevati
-    fn = int((ood_scores <= threshold).sum())
-    fp = int((id_scores  >  threshold).sum())   # falsi allarmi su ID
-    tn = int((id_scores  <= threshold).sum())
+    """
+    Metriche a soglia fissa. Positivo = OOD.
+    Convenzione CORES (Eq. 1): score alto => ID, quindi OOD se score < threshold.
+    """
+    tp = int((ood_scores <  threshold).sum())   # OOD rilevati
+    fn = int((ood_scores >= threshold).sum())
+    fp = int((id_scores  <  threshold).sum())   # falsi allarmi su ID
+    tn = int((id_scores  >= threshold).sum())
 
     eps       = 1e-12
     precision = tp / (tp + fp + eps)
