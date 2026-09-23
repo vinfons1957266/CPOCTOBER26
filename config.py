@@ -26,6 +26,8 @@ LAMBDA_1 = 10.0    # peso per la componente Response Magnitude
 LAMBDA_2 = 1.0     # peso per la componente Response Frequency
 TAU_POS  = 0.5     # soglia di attivazione positiva
 TAU_NEG  = -0.5    # soglia di attivazione negativa
+CORES_EPS = 1e-12  # floor numerico per i log() nello score in log-spazio (Eq. 5/9)
+TOPK_FRAC = 0.20   # frazione di canali selezionati ad ogni layer (Sez. 5.1: top/bottom 20%)
 # ---- OOD threshold calibration --------------------------------------------
 VAL_SPLIT  = 0.15   # frazione di NYU-train riservata alla calibrazione (no training)
 TNR_TARGET = 0.95   # quantile degli score ID di validazione → TNR95
