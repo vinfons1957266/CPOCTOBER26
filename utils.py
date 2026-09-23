@@ -112,7 +112,38 @@ def compute_ood_metrics(id_scores: np.ndarray, ood_scores: np.ndarray) -> dict:
 
     return {"auroc": auroc, "fpr95": fpr95}
 
+def calibrate_threshold(val_id_scores: np.ndarray,
+                        tnr_target: float = 0.95) -> float:
+    """
+    Stima la soglia ID/OOD SOLO su score ID di validazione.
+    Convenzione: score alto => OOD. Predizione: OOD se score > threshold.
+    Con tnr_target=0.95 il 95% dei campioni ID di validazione resta sotto soglia.
+    """
+    return float(np.quantile(val_id_scores, tnr_target))
 
+
+def compute_binary_ood_metrics(id_scores: np.ndarray,
+                               ood_scores: np.ndarray,
+                               threshold: float) -> dict:
+    """Metriche a soglia fissa. Positivo = OOD."""
+    tp = int((ood_scores >  threshold).sum())   # OOD rilevati
+    fn = int((ood_scores <= threshold).sum())
+    fp = int((id_scores  >  threshold).sum())   # falsi allarmi su ID
+    tn = int((id_scores  <= threshold).sum())
+
+    eps       = 1e-12
+    precision = tp / (tp + fp + eps)
+    recall    = tp / (tp + fn + eps)            # = TPR
+    return {
+        "threshold": threshold,
+        "accuracy":  (tp + tn) / (tp + tn + fp + fn + eps),
+        "precision": precision,
+        "recall":    recall,
+        "f1":        2 * precision * recall / (precision + recall + eps),
+        "tnr_test":  tn / (tn + fp + eps),      # sanity check: atteso ≈ 0.95
+        "balanced_accuracy": 0.5 * (recall + tn / (tn + fp + eps)),
+        "confusion": {"tp": tp, "fn": fn, "fp": fp, "tn": tn},
+    }
 # ---------------------------------------------------------------------------
 # Latenza di inferenza GPU
 # ---------------------------------------------------------------------------
