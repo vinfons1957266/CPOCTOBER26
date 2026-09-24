@@ -550,14 +550,25 @@ class CORESScorer:
         n_layers = 0
 
         for name, feat in features.items():
-            if name not in selections:
-                continue
-
-            i_pos, i_neg = selections[name]
             feat = feat.cpu()
 
-            feat_pos = self._gather_channels(feat, i_pos.cpu())  # (B, k_pos, H, W)
-            feat_neg = self._gather_channels(feat, i_neg.cpu())  # (B, k_neg, H, W)
+            if name in selections:
+                i_pos, i_neg = selections[name]
+                feat_pos = self._gather_channels(feat, i_pos.cpu())  # (B, k_pos, H, W)
+                feat_neg = self._gather_channels(feat, i_neg.cpu())  # (B, k_neg, H, W)
+            else:
+                # Per i layer dell'encoder (non inclusi nella catena di backtracking del decoder):
+                # identifichiamo i kernel sample-relevant per-sample in base all'intensità di risposta:
+                # canali con picchi più alti per i_pos, canali con valli più basse per i_neg (top 20%).
+                num_c = feat.shape[1]
+                k = max(1, round(0.20 * num_c))
+                peak = feat.amax(dim=(2, 3))    # (B, C)
+                trough = feat.amin(dim=(2, 3))  # (B, C)
+                i_pos = peak.topk(k, dim=1, largest=True).indices
+                i_neg = trough.topk(k, dim=1, largest=False).indices
+
+                feat_pos = self._gather_channels(feat, i_pos)
+                feat_neg = self._gather_channels(feat, i_neg)
 
             rm_pos, _, rf_pos, _ = cores_response_components(
                 feat_pos, self.tau_pos, self.tau_neg)
@@ -712,25 +723,33 @@ class CORESKernelSelector:
 
         f0 = self.final_conv_weight.detach().reshape(-1)  # (32,)
 
-        # Indice del pixel piu' lontano / piu' vicino nella predizione grezza
+        # Invece di un singolo pixel rumoroso (soggetto ad artefatti di padding ai bordi),
+        # consideriamo le regioni di profondità estrema (top 10% e bottom 10% dei pixel).
         flat_depth = raw_depth.flatten(2)                          # (B, 1, HW)
-        idx_far  = flat_depth.argmax(dim=-1, keepdim=True).expand(
-            -1, num_channels, -1)                                  # (B, C, 1)
-        idx_near = flat_depth.argmin(dim=-1, keepdim=True).expand(
-            -1, num_channels, -1)                                  # (B, C, 1)
+        num_pixels = flat_depth.shape[-1]
+        p_count = max(1, int(0.10 * num_pixels))
 
-        # Risposta di ciascun canale ESATTAMENTE in quei due pixel
+        # Pixel appartenenti alle regioni più lontane (far) e più vicine (near)
+        top_indices = flat_depth.topk(p_count, dim=-1, largest=True).indices   # (B, 1, P)
+        bot_indices = flat_depth.topk(p_count, dim=-1, largest=False).indices  # (B, 1, P)
+
+        # Risposta media di ciascun canale in quelle regioni
         flat_feat = feat_dec_up5.flatten(2)                        # (B, C, HW)
-        response_far  = flat_feat.gather(2, idx_far).squeeze(-1)   # (B, C)
-        response_near = flat_feat.gather(2, idx_near).squeeze(-1)  # (B, C)
+        top_exp = top_indices.expand(-1, num_channels, -1)         # (B, C, P)
+        bot_exp = bot_indices.expand(-1, num_channels, -1)         # (B, C, P)
 
-        # Contributo firmato di ciascun canale al valore predetto in quel
-        # pixel (esatto, poiche' final_conv e' una conv 1x1)
+        response_far  = flat_feat.gather(2, top_exp).mean(dim=-1)  # (B, C)
+        response_near = flat_feat.gather(2, bot_exp).mean(dim=-1)  # (B, C)
+
+        # Contributo ponderato per il peso della proiezione finale
         contrib_far  = f0.unsqueeze(0) * response_far              # (B, C)
         contrib_near = f0.unsqueeze(0) * response_near             # (B, C)
 
-        i_pos = contrib_far.topk(k, dim=1).indices                 # (B, k)
-        i_neg = contrib_near.topk(k, dim=1).indices                # (B, k)
+        # Selezioniamo i canali con maggiore contributo relativo:
+        # i_pos: canali che guidano maggiormente le risposte positive (far)
+        # i_neg: canali che guidano maggiormente le risposte negative (near)
+        i_pos = contrib_far.topk(k, dim=1, largest=True).indices                 # (B, k)
+        i_neg = contrib_near.topk(k, dim=1, largest=False).indices               # (B, k)
 
         return i_pos, i_neg
 

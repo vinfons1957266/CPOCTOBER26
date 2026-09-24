@@ -101,17 +101,22 @@ def compute_ood_metrics(id_scores: np.ndarray, ood_scores: np.ndarray) -> dict:
     Returns:
         dict con chiavi: auroc, fpr95
     """
+    # Convenzione OOD: TPR = frazione di ID classificati come ID (TNR)
+    # FPR = frazione di OOD classificati come ID (FPR)
+    # Per roc_curve, poniamo classe positiva = 1 = ID
     labels = np.concatenate([
-        np.zeros(len(id_scores)),
-        np.ones(len(ood_scores)),
+        np.ones(len(id_scores)),      # ID = 1
+        np.zeros(len(ood_scores)),    # OOD = 0
     ])
-    # -score: "OOD-ness" crescente, coerente con la convenzione scikit-learn
-    ood_ness = np.concatenate([-id_scores, -ood_scores])
+    # Score: alto => ID, basso => OOD.
+    # Usiamo direttamente gli score perche' vogliamo che roc_curve
+    # misuri TPR per la classe 1 usando soglie decrescenti.
+    scores = np.concatenate([id_scores, ood_scores])
 
-    auroc = roc_auc_score(labels, ood_ness)
+    auroc = roc_auc_score(labels, scores)
 
-    # FPR al 95 % TPR
-    fpr, tpr, _ = roc_curve(labels, ood_ness)
+    # FPR al 95 % TPR (TPR = ID as ID, FPR = OOD as ID)
+    fpr, tpr, _ = roc_curve(labels, scores)
     idx   = np.searchsorted(tpr, 0.95)
     fpr95 = fpr[min(idx, len(fpr) - 1)]
 
