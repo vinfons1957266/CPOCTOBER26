@@ -550,25 +550,21 @@ class CORESScorer:
         n_layers = 0
 
         for name, feat in features.items():
+            if name not in selections:
+                # Layer encoder: esclusi dalla catena di backtracking (Decisione 2 —
+                # solo decoder, vedi CORESKernelSelector). Non introduciamo una
+                # selezione ad-hoc basata sulla sola intensità della risposta: un
+                # criterio "canale selezionato perché ha valori grandi" userebbe
+                # come criterio di selezione la stessa quantità che RM poi misura,
+                # introducendo un bias di selezione indipendente da quanto il
+                # campione sia realmente ID/OOD.
+                continue
+
+            i_pos, i_neg = selections[name]
             feat = feat.cpu()
 
-            if name in selections:
-                i_pos, i_neg = selections[name]
-                feat_pos = self._gather_channels(feat, i_pos.cpu())  # (B, k_pos, H, W)
-                feat_neg = self._gather_channels(feat, i_neg.cpu())  # (B, k_neg, H, W)
-            else:
-                # Per i layer dell'encoder (non inclusi nella catena di backtracking del decoder):
-                # identifichiamo i kernel sample-relevant per-sample in base all'intensità di risposta:
-                # canali con picchi più alti per i_pos, canali con valli più basse per i_neg (top 20%).
-                num_c = feat.shape[1]
-                k = max(1, round(0.20 * num_c))
-                peak = feat.amax(dim=(2, 3))    # (B, C)
-                trough = feat.amin(dim=(2, 3))  # (B, C)
-                i_pos = peak.topk(k, dim=1, largest=True).indices
-                i_neg = trough.topk(k, dim=1, largest=False).indices
-
-                feat_pos = self._gather_channels(feat, i_pos)
-                feat_neg = self._gather_channels(feat, i_neg)
+            feat_pos = self._gather_channels(feat, i_pos.cpu())  # (B, k_pos, H, W)
+            feat_neg = self._gather_channels(feat, i_neg.cpu())  # (B, k_neg, H, W)
 
             rm_pos, _, rf_pos, _ = cores_response_components(
                 feat_pos, self.tau_pos, self.tau_neg)
@@ -745,11 +741,14 @@ class CORESKernelSelector:
         contrib_far  = f0.unsqueeze(0) * response_far              # (B, C)
         contrib_near = f0.unsqueeze(0) * response_near             # (B, C)
 
-        # Selezioniamo i canali con maggiore contributo relativo:
-        # i_pos: canali che guidano maggiormente le risposte positive (far)
-        # i_neg: canali che guidano maggiormente le risposte negative (near)
+        # TopK per ENTRAMBI i rami (Eq. 6, non l'asimmetria TopK/BotK di Eq. 8 —
+        # quella si applica solo al backtracking intermedio, vedi B3/backtrack).
+        # Il prodotto F0·response e' firmato: TopK premia sia (F0 grande positivo,
+        # response grande positiva) sia (F0 grande negativo, response grande
+        # negativa) — entrambi i casi spiegano fortemente il valore osservato
+        # nella rispettiva regione (far per i_pos, near per i_neg).
         i_pos = contrib_far.topk(k, dim=1, largest=True).indices                 # (B, k)
-        i_neg = contrib_near.topk(k, dim=1, largest=False).indices               # (B, k)
+        i_neg = contrib_near.topk(k, dim=1, largest=True).indices                # (B, k)
 
         return i_pos, i_neg
 

@@ -21,7 +21,7 @@ BATCH_SIZE  = 16
 NUM_WORKERS = 2
 
 # ---- Training --------------------------------------------------------------
-EPOCHS        = 20
+EPOCHS        = 2
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY  = 1e-4
 
