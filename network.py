@@ -741,14 +741,13 @@ class CORESKernelSelector:
         contrib_far  = f0.unsqueeze(0) * response_far              # (B, C)
         contrib_near = f0.unsqueeze(0) * response_near             # (B, C)
 
-        # TopK per ENTRAMBI i rami (Eq. 6, non l'asimmetria TopK/BotK di Eq. 8 —
-        # quella si applica solo al backtracking intermedio, vedi B3/backtrack).
-        # Il prodotto F0·response e' firmato: TopK premia sia (F0 grande positivo,
-        # response grande positiva) sia (F0 grande negativo, response grande
-        # negativa) — entrambi i casi spiegano fortemente il valore osservato
-        # nella rispettiva regione (far per i_pos, near per i_neg).
+        # Isolamento sperimentale (fix-Auroc3): SOLO il flip TopK/BotK per i_neg
+        # ri-applicato qui, senza l'aggiunta dei layer encoder (rimasta esclusa,
+        # vedi compute_score_per_sample_selected) — per capire se il flip da
+        # solo riproduce il calo di AUROC osservato quando entrambe le modifiche
+        # erano applicate insieme, o se era principalmente l'aggiunta encoder.
         i_pos = contrib_far.topk(k, dim=1, largest=True).indices                 # (B, k)
-        i_neg = contrib_near.topk(k, dim=1, largest=True).indices                # (B, k)
+        i_neg = contrib_near.topk(k, dim=1, largest=False).indices               # (B, k)
 
         return i_pos, i_neg
 
