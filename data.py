@@ -56,9 +56,10 @@ class NYUDepthV2Dataset(Dataset):
         rgb_dir   = os.path.join(split_dir, "rgb")
         depth_dir = os.path.join(split_dir, "depth")
 
+        valid_exts = (".png", ".jpg", ".jpeg")
         if os.path.isdir(rgb_dir) and os.path.isdir(depth_dir):
-            rgb_files   = sorted(os.listdir(rgb_dir))
-            depth_files = sorted(os.listdir(depth_dir))
+            rgb_files   = sorted([f for f in os.listdir(rgb_dir) if f.lower().endswith(valid_exts)])
+            depth_files = sorted([f for f in os.listdir(depth_dir) if f.lower().endswith(valid_exts)])
             if len(rgb_files) > 0 and len(rgb_files) == len(depth_files):
                 self.rgb_paths   = [os.path.join(rgb_dir, f)   for f in rgb_files]
                 self.depth_paths = [os.path.join(depth_dir, f) for f in depth_files]
@@ -140,9 +141,10 @@ class KITTIOODDataset(Dataset):
         rgb_dir   = os.path.join(root, "rgb")
         depth_dir = os.path.join(root, "depth")
 
+        valid_exts = (".png", ".jpg", ".jpeg")
         if os.path.isdir(rgb_dir) and os.path.isdir(depth_dir):
-            rgb_files   = sorted(os.listdir(rgb_dir))
-            depth_files = sorted(os.listdir(depth_dir))
+            rgb_files   = sorted([f for f in os.listdir(rgb_dir) if f.lower().endswith(valid_exts)])
+            depth_files = sorted([f for f in os.listdir(depth_dir) if f.lower().endswith(valid_exts)])
             if len(rgb_files) > 0 and len(rgb_files) == len(depth_files):
                 self.rgb_paths   = [os.path.join(rgb_dir, f)   for f in rgb_files]
                 self.depth_paths = [os.path.join(depth_dir, f) for f in depth_files]

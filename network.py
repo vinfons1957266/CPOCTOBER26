@@ -2,17 +2,17 @@
 =============================================================================
 Sezione 5 — NETWORK
 =============================================================================
-Architettura FastDepth (MobileNetV1 encoder + NNConv5 decoder)
+Architettura FastDepth (MobileNetV2 encoder pre-addestrato + NNConv5 decoder)
 e meccanismo CORES per OOD detection.
 
 Classi:
     DepthwiseSeparableConv   — blocco convoluzionale separabile in profondità
     NNConv5UpSampleBlock     — upsampling NN ×2 + 5×5 DSConv + skip additivo
-    MobileNetV1Encoder       — encoder a 6 stadi (32→1024)
+    MobileNetV2Encoder       — encoder basato su MobileNetV2 ImageNet (tutti i pesi)
     NNConv5Decoder           — decoder a 5 stadi (1024→1)
     FastDepthMDE             — rete completa encoder-decoder
     ForwardHookHandler       — gestione forward hook per cattura feature map
-    CORESScorer              — calcolo score OOD layer-by-layer
+    CORESScorer              — calcolo score OOD layer-by-layer (supporta tau per-layer)
 """
 
 import numpy as np
@@ -104,95 +104,100 @@ class NNConv5UpSampleBlock(nn.Module):
 
 
 # ===========================================================================
-# Encoder — MobileNetV1
+# Encoder — MobileNetV2 (pre-addestrato completo su ImageNet)
 # ===========================================================================
 
-class MobileNetV1Encoder(nn.Module):
+class MobileNetV2Encoder(nn.Module):
     """
-    Encoder stile MobileNetV1 a 6 stadi.
+    Encoder basato su MobileNetV2 pre-addestrato completo su ImageNet.
 
-    Produce feature map a 1/2, 1/4, 1/8, 1/16, 1/32 della risoluzione di input.
-    Progressione canali: 32 → 64 → 128 → 256 → 512 → 1024
+    A differenza del vecchio MobileNetV1Encoder (che copiava SOLO il primo
+    layer 3→32 da MobileNetV2 e inizializzava tutto il resto con Kaiming
+    random), questo encoder usa TUTTI i pesi pre-addestrati del backbone
+    MobileNetV2, ottenendo filtri convoluzionali semanticamente ricchi ad
+    ogni livello — prerequisito fondamentale per CORES, che si basa sulla
+    premessa che i kernel rispondono diversamente a campioni ID vs OOD.
+
+    Struttura MobileNetV2 (torchvision):
+        features[0:2]   → 224→112,  16 ch  (conv iniziale + 1 InvertedResidual)
+        features[2:4]   → 112→56,   24 ch  (2 InvertedResidual, stride=2)
+        features[4:7]   → 56→28,    32 ch  (3 InvertedResidual, stride=2)
+        features[7:14]  → 28→14,    96 ch  (7 InvertedResidual, stride=2)
+        features[14:18] → 14→7,    320 ch  (4 InvertedResidual, stride=2)
+
+    Proiezioni 1×1 + BN (senza ReLU) adattano i canali nativi MobileNetV2
+    (16, 24, 32, 96, 320) a quelli attesi dal decoder NNConv5
+    (64, 128, 256, 512, 1024). Le BN delle proiezioni servono anche come
+    tap point per gli hook CORES: la mancanza di ReLU preserva sia le
+    risposte positive che negative (RM+/RM-, RF+/RF-).
+
+    Produce la stessa interfaccia del vecchio encoder:
+        output: (B, 1024, 7, 7) — bottleneck
+        skips:  [s1(64, 112), s2(128, 56), s3(256, 28), s4(512, 14)]
     """
 
     def __init__(self, pretrained: bool = True):
         super().__init__()
 
-        # Stage 0: conv standard  (3 → 32, stride=2)
-        self.stage0 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=False),  # inplace=False: vedi nota in DepthwiseSeparableConv
+        backbone = models.mobilenet_v2(
+            weights=models.MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
         )
+        feats = list(backbone.features.children())
 
-        # Stage 1: 32 → 64  (stride=1)  → 1/2
-        self.stage1 = DepthwiseSeparableConv(32, 64, stride=1)
+        # Suddivisione per risoluzione spaziale (strides di MobileNetV2)
+        self.stage0 = nn.Sequential(*feats[0:2])     # 224→112, 16 ch
+        self.stage1 = nn.Sequential(*feats[2:4])      # 112→56,  24 ch
+        self.stage2 = nn.Sequential(*feats[4:7])      # 56→28,   32 ch
+        self.stage3 = nn.Sequential(*feats[7:14])     # 28→14,   96 ch
+        self.stage4 = nn.Sequential(*feats[14:18])    # 14→7,   320 ch
+        # features[18] (ConvBNReLU 320→1280) NON incluso: usa ReLU6 che
+        # clippa i negativi, eliminando RM-/RF- per CORES.
 
-        # Stage 2: 64 → 128 (stride=2)  → 1/4
-        self.stage2 = nn.Sequential(
-            DepthwiseSeparableConv(64, 128, stride=2),
-            DepthwiseSeparableConv(128, 128, stride=1),
-        )
+        # Proiezioni 1×1 + BN — adatta i canali MobileNetV2 al decoder.
+        # Nessuna ReLU dopo BN: preserva le risposte negative per CORES.
+        self.proj_s0 = nn.Sequential(
+            nn.Conv2d(16, 64, 1, bias=False), nn.BatchNorm2d(64))
+        self.proj_s1 = nn.Sequential(
+            nn.Conv2d(24, 128, 1, bias=False), nn.BatchNorm2d(128))
+        self.proj_s2 = nn.Sequential(
+            nn.Conv2d(32, 256, 1, bias=False), nn.BatchNorm2d(256))
+        self.proj_s3 = nn.Sequential(
+            nn.Conv2d(96, 512, 1, bias=False), nn.BatchNorm2d(512))
+        self.proj_bottleneck = nn.Sequential(
+            nn.Conv2d(320, 1024, 1, bias=False), nn.BatchNorm2d(1024))
 
-        # Stage 3: 128 → 256 (stride=2) → 1/8
-        self.stage3 = nn.Sequential(
-            DepthwiseSeparableConv(128, 256, stride=2),
-            DepthwiseSeparableConv(256, 256, stride=1),
-        )
+        self._init_projections()
 
-        # Stage 4: 256 → 512 (stride=2) → 1/16
-        self.stage4 = nn.Sequential(
-            DepthwiseSeparableConv(256, 512, stride=2),
-            *[DepthwiseSeparableConv(512, 512, stride=1) for _ in range(5)],
-        )
-
-        # Stage 5: 512 → 1024 (stride=2) → 1/32
-        self.stage5 = nn.Sequential(
-            DepthwiseSeparableConv(512, 1024, stride=2),
-            DepthwiseSeparableConv(1024, 1024, stride=1),
-        )
-
-        if pretrained:
-            self._init_from_mobilenet_v2_approx()
-
-    def _init_from_mobilenet_v2_approx(self):
-        """
-        Inizializzazione approssimata da torchvision MobileNetV2.
-        Copia i pesi del primo strato conv (3→32) poiché le architetture
-        differiscono nei livelli successivi.  Il resto usa Kaiming normal.
-        """
-        try:
-            mv2 = models.mobilenet_v2(
-                weights=models.MobileNet_V2_Weights.IMAGENET1K_V1
-            )
-            with torch.no_grad():
-                self.stage0[0].weight.copy_(mv2.features[0][0].weight)
-        except Exception:
-            pass  # fallback silenzioso a init casuale
-
-        # Kaiming init per i layer rimanenti
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d) and m is not self.stage0[0]:
-                nn.init.kaiming_normal_(m.weight, mode="fan_out",
-                                        nonlinearity="relu")
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+    def _init_projections(self):
+        """Inizializzazione Kaiming per le proiezioni 1×1 (i pesi del
+        backbone MobileNetV2 restano intatti)."""
+        for proj in [self.proj_s0, self.proj_s1, self.proj_s2,
+                     self.proj_s3, self.proj_bottleneck]:
+            nn.init.kaiming_normal_(proj[0].weight, mode="fan_out",
+                                    nonlinearity="relu")
+            nn.init.ones_(proj[1].weight)
+            nn.init.zeros_(proj[1].bias)
 
     def forward(self, x: torch.Tensor):
         """
         Returns:
-            out:   feature map finale dell'encoder (1/32)
-            skips: lista di feature map intermedie [s1, s2, s3, s4]
+            out:   feature map proiettata del bottleneck (B, 1024, 7, 7)
+            skips: lista di feature map proiettate [s1, s2, s3, s4]
         """
-        s0 = self.stage0(x)   # (B, 32,  112, 112)
-        s1 = self.stage1(s0)  # (B, 64,  112, 112)
-        s2 = self.stage2(s1)  # (B, 128,  56,  56)
-        s3 = self.stage3(s2)  # (B, 256,  28,  28)
-        s4 = self.stage4(s3)  # (B, 512,  14,  14)
-        s5 = self.stage5(s4)  # (B, 1024,  7,   7)
+        s0 = self.stage0(x)    # (B,  16, 112, 112)
+        s1 = self.stage1(s0)   # (B,  24,  56,  56)
+        s2 = self.stage2(s1)   # (B,  32,  28,  28)
+        s3 = self.stage3(s2)   # (B,  96,  14,  14)
+        s4 = self.stage4(s3)   # (B, 320,   7,   7)
 
-        return s5, [s1, s2, s3, s4]
+        # Proiezioni 1×1 per compatibilità decoder + tap CORES
+        p0 = self.proj_s0(s0)           # (B,   64, 112, 112)
+        p1 = self.proj_s1(s1)           # (B,  128,  56,  56)
+        p2 = self.proj_s2(s2)           # (B,  256,  28,  28)
+        p3 = self.proj_s3(s3)           # (B,  512,  14,  14)
+        out = self.proj_bottleneck(s4)  # (B, 1024,   7,   7)
+
+        return out, [p0, p1, p2, p3]
 
 
 # ===========================================================================
@@ -265,7 +270,7 @@ class FastDepthMDE(nn.Module):
 
     def __init__(self, pretrained_encoder: bool = True):
         super().__init__()
-        self.encoder = MobileNetV1Encoder(pretrained=pretrained_encoder)
+        self.encoder = MobileNetV2Encoder(pretrained=pretrained_encoder)
         self.decoder = NNConv5Decoder()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -409,31 +414,53 @@ class CORESScorer:
 
     def __init__(
         self,
-        tau_pos:  float = TAU_POS,
-        tau_neg:  float = TAU_NEG,
+        tau_pos=TAU_POS,
+        tau_neg=TAU_NEG,
         lambda_1: float = LAMBDA_1,
         lambda_2: float = LAMBDA_2,
         eps:      float = CORES_EPS,
     ):
+        # tau_pos/tau_neg: float (globale) o dict[str, float] (per-layer)
         self.tau_pos  = tau_pos
         self.tau_neg  = tau_neg
         self.lambda_1 = lambda_1
         self.lambda_2 = lambda_2
         self.eps      = eps
 
-    def compute_layer_score(self, feat: torch.Tensor) -> float:
+    def _resolve_tau(self, layer_name=None):
+        """Risolve tau_pos/tau_neg per un dato layer.
+        Se tau è un dict e il layer è noto, restituisce il valore specifico;
+        altrimenti restituisce il fallback globale."""
+        if isinstance(self.tau_pos, dict) and layer_name is not None:
+            tp = self.tau_pos.get(layer_name, TAU_POS)
+        elif isinstance(self.tau_pos, dict):
+            tp = TAU_POS
+        else:
+            tp = self.tau_pos
+        if isinstance(self.tau_neg, dict) and layer_name is not None:
+            tn = self.tau_neg.get(layer_name, TAU_NEG)
+        elif isinstance(self.tau_neg, dict):
+            tn = TAU_NEG
+        else:
+            tn = self.tau_neg
+        return tp, tn
+
+    def compute_layer_score(self, feat: torch.Tensor,
+                            layer_name: str = None) -> float:
         """
         Calcola lo score CORES (in log-spazio, Eq. 5/9) per un singolo
         feature map.
 
         Args:
             feat: (B, C, H, W) o (C, H, W) feature map da un layer.
+            layer_name: nome del layer (per tau per-layer); None usa il fallback.
 
         Returns:
             log-score scalare per questo layer (media sul batch).
         """
+        tp, tn = self._resolve_tau(layer_name)
         rm_pos, rm_neg, rf_pos, rf_neg = cores_response_components(
-            feat, self.tau_pos, self.tau_neg)
+            feat, tp, tn)
 
         # log(S) per campione — prodotto di Eq. 5/9 in log-spazio (vedi
         # docstring della classe per la derivazione e la motivazione)
@@ -457,8 +484,8 @@ class CORESScorer:
         if len(features) == 0:
             return 0.0
 
-        layer_scores = [self.compute_layer_score(feat)
-                        for feat in features.values()]
+        layer_scores = [self.compute_layer_score(feat, name)
+                        for name, feat in features.items()]
         return float(np.mean(layer_scores))
 
     def compute_score_per_sample(self, features: dict,
@@ -478,9 +505,10 @@ class CORESScorer:
 
         per_sample = torch.zeros(batch_size, device="cpu")
 
-        for feat in features.values():
+        for name, feat in features.items():
+            tp, tn = self._resolve_tau(name)
             rm_pos, rm_neg, rf_pos, rf_neg = cores_response_components(
-                feat.cpu(), self.tau_pos, self.tau_neg)
+                feat.cpu(), tp, tn)
 
             log_score = (
                 self.lambda_1 * (torch.log(rm_pos + self.eps) + torch.log(rm_neg + self.eps))
@@ -551,13 +579,6 @@ class CORESScorer:
 
         for name, feat in features.items():
             if name not in selections:
-                # Layer encoder: esclusi dalla catena di backtracking (Decisione 2 —
-                # solo decoder, vedi CORESKernelSelector). Non introduciamo una
-                # selezione ad-hoc basata sulla sola intensità della risposta: un
-                # criterio "canale selezionato perché ha valori grandi" userebbe
-                # come criterio di selezione la stessa quantità che RM poi misura,
-                # introducendo un bias di selezione indipendente da quanto il
-                # campione sia realmente ID/OOD.
                 continue
 
             i_pos, i_neg = selections[name]
@@ -566,10 +587,11 @@ class CORESScorer:
             feat_pos = self._gather_channels(feat, i_pos.cpu())  # (B, k_pos, H, W)
             feat_neg = self._gather_channels(feat, i_neg.cpu())  # (B, k_neg, H, W)
 
+            tp, tn = self._resolve_tau(name)
             rm_pos, _, rf_pos, _ = cores_response_components(
-                feat_pos, self.tau_pos, self.tau_neg)
+                feat_pos, tp, tn)
             _, rm_neg, _, rf_neg = cores_response_components(
-                feat_neg, self.tau_pos, self.tau_neg)
+                feat_neg, tp, tn)
 
             log_score = (
                 self.lambda_1 * (torch.log(rm_pos + self.eps) + torch.log(rm_neg + self.eps))

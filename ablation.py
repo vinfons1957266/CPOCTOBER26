@@ -75,12 +75,11 @@ def _all_target_layers(model: FastDepthMDE) -> OrderedDict:
     motivo (RM-/RF- sarebbero sempre nulli su un tap post-ReLU).
     """
     layers = OrderedDict()
-    layers["enc_stage0"] = model.encoder.stage0[1]
-    layers["enc_stage1"] = model.encoder.stage1.bn_pw
-    layers["enc_stage2"] = model.encoder.stage2[-1].bn_pw
-    layers["enc_stage3"] = model.encoder.stage3[-1].bn_pw
-    layers["enc_stage4"] = model.encoder.stage4[-1].bn_pw
-    layers["enc_stage5"] = model.encoder.stage5[-1].bn_pw
+    layers["enc_stage0"] = model.encoder.proj_s0[1]
+    layers["enc_stage1"] = model.encoder.proj_s1[1]
+    layers["enc_stage2"] = model.encoder.proj_s2[1]
+    layers["enc_stage3"] = model.encoder.proj_s3[1]
+    layers["enc_stage4"] = model.encoder.proj_bottleneck[1]
     layers["dec_up1"]    = model.decoder.up1.conv.bn_pw
     layers["dec_up2"]    = model.decoder.up2.conv.bn_pw
     layers["dec_up3"]    = model.decoder.up3.conv.bn_pw

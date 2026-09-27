@@ -104,13 +104,12 @@ def _get_target_layers(model: FastDepthMDE) -> dict:
     """
     targets = {}
 
-    # Encoder layers (pre-attivazione: output BatchNorm, prima della ReLU)
-    targets["enc_stage0"] = model.encoder.stage0[1]           # BN dopo la conv iniziale
-    targets["enc_stage1"] = model.encoder.stage1.bn_pw
-    targets["enc_stage2"] = model.encoder.stage2[-1].bn_pw
-    targets["enc_stage3"] = model.encoder.stage3[-1].bn_pw
-    targets["enc_stage4"] = model.encoder.stage4[-1].bn_pw
-    targets["enc_stage5"] = model.encoder.stage5[-1].bn_pw
+    # Encoder layers (pre-attivazione: output BatchNorm delle proiezioni, prima della ReLU)
+    targets["enc_stage0"] = model.encoder.proj_s0[1]
+    targets["enc_stage1"] = model.encoder.proj_s1[1]
+    targets["enc_stage2"] = model.encoder.proj_s2[1]
+    targets["enc_stage3"] = model.encoder.proj_s3[1]
+    targets["enc_stage4"] = model.encoder.proj_bottleneck[1]
 
     # Decoder layers (pre-attivazione e pre-skip-add: bn_pw del blocco NNConv5)
     targets["dec_up1"] = model.decoder.up1.conv.bn_pw
@@ -389,29 +388,27 @@ def calibrate_cores_taus(
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225],
     )
 
-    # --- 1. Candidati adattivi: percentili di |picco/valle per canale| su id_val ---
-    pooled_extremes = []
+    # --- 1. Raccoglie picchi e valli PER OGNI SINGOLO LAYER su id_val ---
+    layer_peaks = {name: [] for name in target_layers}
+    layer_troughs = {name: [] for name in target_layers}
     with torch.no_grad():
         for rgb, _ in id_val_loader:
             rgb = rgb.to(DEVICE)
             hook_handler.clear()
             _ = model(rgb)
-            for feat in hook_handler.get_features().values():
-                pooled_extremes.append(feat.amax(dim=(2, 3)).abs().flatten().cpu())
-                pooled_extremes.append(feat.amin(dim=(2, 3)).abs().flatten().cpu())
-    pooled = torch.cat(pooled_extremes)
+            feats = hook_handler.get_features()
+            for name in target_layers:
+                feat = feats[name]
+                layer_peaks[name].append(feat.amax(dim=(2, 3)).flatten().cpu())
+                layer_troughs[name].append(feat.amin(dim=(2, 3)).flatten().cpu())
 
-    percentiles = torch.linspace(50.0, 95.0, n_candidates)
-    candidates = sorted({
-        round(float(torch.quantile(pooled, p / 100.0)), 4)
-        for p in percentiles
-    } - {0.0})
-    if not candidates:
-        candidates = [TAU_POS]  # fallback estremo: distribuzione degenere
+    layer_peaks_cat = {name: torch.cat(layer_peaks[name]) for name in target_layers}
+    layer_troughs_cat = {name: torch.cat(layer_troughs[name]) for name in target_layers}
 
-    # --- 2. Rumore generato UNA sola volta, riusato per ogni candidato tau ---
-    #     (le attivazioni grezze non dipendono da tau — solo la riduzione
-    #     RM/RF lo fa — quindi non serve rigenerare il rumore ad ogni giro)
+    # Griglia di percentili per la ricerca (da 50% a 90%)
+    percentiles = torch.linspace(50.0, 90.0, n_candidates)
+
+    # --- 2. Rumore generato UNA sola volta ---
     gauss_loader = DataLoader(
         TensorDataset(_generate_noise_batch(n_noise_samples, IMAGE_SIZE, "gaussian", img_transform),
                      torch.zeros(n_noise_samples)),
@@ -423,11 +420,22 @@ def calibrate_cores_taus(
         batch_size=BATCH_SIZE,
     )
 
-    # --- 3. Ricerca sulla griglia ---
+    # --- 3. Ricerca del miglior percentile per-layer sulla griglia ---
     diagnostics = []
     best = None
-    for tau_mag in candidates:
-        scorer = CORESScorer(tau_pos=tau_mag, tau_neg=-tau_mag,
+    for p in percentiles:
+        p_val = float(p)
+        # Per ogni layer: tau_pos al percentile p_val dei picchi,
+        # tau_neg al percentile (100 - p_val) delle valli
+        cand_tau_pos = {}
+        cand_tau_neg = {}
+        for name in target_layers:
+            tp = float(torch.quantile(layer_peaks_cat[name], p_val / 100.0))
+            tn = float(torch.quantile(layer_troughs_cat[name], (100.0 - p_val) / 100.0))
+            cand_tau_pos[name] = max(tp, 1e-4)
+            cand_tau_neg[name] = min(tn, -1e-4)
+
+        scorer = CORESScorer(tau_pos=cand_tau_pos, tau_neg=cand_tau_neg,
                              lambda_1=LAMBDA_1, lambda_2=LAMBDA_2)
 
         val_scores   = _collect_cores_scores(model, id_val_loader, scorer, hook_handler)
@@ -435,14 +443,19 @@ def calibrate_cores_taus(
         unif_scores  = _collect_cores_scores(model, unif_loader,   scorer, hook_handler)
 
         threshold = calibrate_threshold(val_scores, tnr_target)
-        # Convenzione Eq. 1: score >= soglia => predetto ID. Il rumore
-        # DOVREBBE finire sotto soglia (OOD); FPR = quanto spesso non ci finisce.
         fpr_gauss = float((gauss_scores >= threshold).mean())
         fpr_unif  = float((unif_scores  >= threshold).mean())
         avg_fpr   = 0.5 * (fpr_gauss + fpr_unif)
 
-        entry = {"tau_pos": tau_mag, "tau_neg": -tau_mag, "threshold": threshold,
-                 "fpr_gaussian": fpr_gauss, "fpr_uniform": fpr_unif, "avg_fpr": avg_fpr}
+        entry = {
+            "percentile": p_val,
+            "tau_pos": cand_tau_pos,
+            "tau_neg": cand_tau_neg,
+            "threshold": threshold,
+            "fpr_gaussian": fpr_gauss,
+            "fpr_uniform": fpr_unif,
+            "avg_fpr": avg_fpr,
+        }
         diagnostics.append(entry)
         if best is None or avg_fpr < best["avg_fpr"]:
             best = entry
@@ -450,13 +463,18 @@ def calibrate_cores_taus(
     hook_handler.remove()
 
     print(f"\n{'='*60}")
-    print("  Calibrazione TAU_POS/TAU_NEG (rumore Gaussiano/uniforme)")
+    print("  Calibrazione PER-LAYER TAU_POS/TAU_NEG (rumore Gaussiano/uniforme)")
     print(f"{'='*60}")
-    print(f"  {'tau_pos':>10s} {'tau_neg':>10s} {'FPR gauss':>10s} {'FPR unif':>10s} {'avg FPR':>10s}")
+    print(f"  {'Percentile':>10s} {'FPR gauss':>10s} {'FPR unif':>10s} {'avg FPR':>10s}")
     for d in diagnostics:
         marker = "  <-- scelto" if d is best else ""
-        print(f"  {d['tau_pos']:>10.4f} {d['tau_neg']:>10.4f} "
-              f"{d['fpr_gaussian']:>10.4f} {d['fpr_uniform']:>10.4f} {d['avg_fpr']:>10.4f}{marker}")
+        print(f"  {d['percentile']:>9.1f}% {d['fpr_gaussian']:>10.4f} "
+              f"{d['fpr_uniform']:>10.4f} {d['avg_fpr']:>10.4f}{marker}")
+
+    print("\n  Valori tau per-layer scelti:")
+    for name in target_layers:
+        print(f"    {name:<16s}: tau_pos = {best['tau_pos'][name]:>8.4f}, "
+              f"tau_neg = {best['tau_neg'][name]:>8.4f}")
     print(f"{'='*60}\n")
 
     return best["tau_pos"], best["tau_neg"], {"candidates": diagnostics, "chosen": best}
@@ -582,8 +600,14 @@ def run_full_experiment() -> None:
     #    SOLO su id_val, mai su id_test/ood_test)
     print("[6/8] Calibrating CORES TAU_POS/TAU_NEG on trained model ...")
     tau_pos, tau_neg, tau_diagnostics = calibrate_cores_taus(model, id_val_loader)
-    print(f"       Calibrated: TAU_POS={tau_pos:.4f}  TAU_NEG={tau_neg:.4f}  "
-          f"(config.py defaults: {TAU_POS}/{TAU_NEG})")
+    if isinstance(tau_pos, dict):
+        avg_tp = float(np.mean(list(tau_pos.values())))
+        avg_tn = float(np.mean(list(tau_neg.values())))
+        print(f"       Calibrated per-layer: avg TAU_POS={avg_tp:.4f}  avg TAU_NEG={avg_tn:.4f}  "
+              f"({len(tau_pos)} layers)")
+    else:
+        print(f"       Calibrated: TAU_POS={tau_pos:.4f}  TAU_NEG={tau_neg:.4f}  "
+              f"(config.py defaults: {TAU_POS}/{TAU_NEG})")
 
     # 7. OOD Detection
     print("[7/8] Evaluating CORES OOD detection ...")
