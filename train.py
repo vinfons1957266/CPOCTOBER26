@@ -106,33 +106,35 @@ def train_one_epoch(
         running_loss += loss.item()
         num_batches += 1
 
-        if (batch_idx + 1) % max(1, len(loader) // 5) == 0:
+        if (batch_idx + 1) % max(1, len(loader) // 5) == 0 or (batch_idx + 1) == len(loader):
             lr_str = ""
             if scheduler is not None:
                 lr_str = f"  LR: {scheduler.get_last_lr()[0]:.6f}"
             print(f"  Epoch [{epoch+1}] Batch [{batch_idx+1}/{len(loader)}]  "
-                  f"Loss: {loss.item():.6f}{lr_str}")
+                  f"Loss: {loss.item():.6f}{lr_str}", flush=True)
 
     avg_loss = running_loss / max(num_batches, 1)
     return avg_loss
 
 
-def train_fastdepth(
+def train_model(
     model: nn.Module,
     train_loader: DataLoader,
+    model_name: str = "FastDepth",
     epochs: int = EPOCHS,
     lr: float = LEARNING_RATE,
     weight_decay: float = WEIGHT_DECAY,
 ) -> list:
     """
-    Loop completo di addestramento per FastDepth su NYU Depth V2.
+    Loop completo di addestramento su NYU Depth V2 per FastDepth o METER.
 
     Usa BerHu loss (standard per depth estimation) e scheduler OneCycleLR
-    (warmup + cosine annealing) per una convergenza più rapida e stabile.
+    (warmup + cosine annealing) per una convergenza rapida e stabile.
 
     Args:
-        model:        istanza di FastDepthMDE (spostata su DEVICE internamente)
+        model:        istanza di FastDepthMDE o METERMDE
         train_loader: DataLoader di training
+        model_name:   nome del modello per log ("FastDepth" o "METER")
         epochs:       numero di epoche
         lr:           learning rate massimo per OneCycleLR
         weight_decay: regolarizzazione L2
@@ -142,7 +144,7 @@ def train_fastdepth(
     """
     model = model.to(DEVICE)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=weight_decay,
+        model.parameters(), lr=lr, weight_decay=weight_decay, foreach=False,
     )
     criterion = BerHuLoss(threshold_ratio=0.2)
 
@@ -154,11 +156,11 @@ def train_fastdepth(
     )
 
     epoch_losses = []
-    print(f"\n{'='*60}")
-    print(f"  Training FastDepth  |  Device: {DEVICE}")
-    print(f"  Epochs: {epochs}  |  Max LR: {lr}  |  WD: {weight_decay}")
-    print(f"  Loss: BerHu  |  Scheduler: OneCycleLR")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*60}", flush=True)
+    print(f"  Training {model_name}  |  Device: {DEVICE}", flush=True)
+    print(f"  Epochs: {epochs}  |  Max LR: {lr}  |  WD: {weight_decay}", flush=True)
+    print(f"  Loss: BerHu  |  Scheduler: OneCycleLR", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
     for epoch in range(epochs):
         t0 = time.time()
@@ -166,9 +168,21 @@ def train_fastdepth(
                                    criterion, epoch, scheduler=scheduler)
         elapsed = time.time() - t0
         epoch_losses.append(avg_loss)
-        print(f"  => Epoch [{epoch+1}/{epochs}]  "
+        print(f"  => [{model_name}] Epoch [{epoch+1}/{epochs}]  "
               f"Avg Loss: {avg_loss:.6f}  "
-              f"Time: {elapsed:.1f}s\n")
+              f"Time: {elapsed:.1f}s\n", flush=True)
 
-    print("Training complete.\n")
+    print(f"Training {model_name} complete.\n", flush=True)
     return epoch_losses
+
+
+def train_fastdepth(
+    model: nn.Module,
+    train_loader: DataLoader,
+    epochs: int = EPOCHS,
+    lr: float = LEARNING_RATE,
+    weight_decay: float = WEIGHT_DECAY,
+) -> list:
+    """Wrapper di retrocompatibilità per FastDepth."""
+    return train_model(model, train_loader, model_name="FastDepth",
+                       epochs=epochs, lr=lr, weight_decay=weight_decay)

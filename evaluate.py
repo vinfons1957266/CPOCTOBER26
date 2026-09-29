@@ -79,9 +79,9 @@ def evaluate_mde_on_id(
     print(f"{'='*60}")
     print(f"  AbsRel : {agg['abs_rel']:.4f}")
     print(f"  RMSE   : {agg['rmse']:.4f}")
-    print(f"  δ₁     : {agg['delta_1']:.4f}")
-    print(f"  δ₂     : {agg['delta_2']:.4f}")
-    print(f"  δ₃     : {agg['delta_3']:.4f}")
+    print(f"  delta_1: {agg['delta_1']:.4f}")
+    print(f"  delta_2: {agg['delta_2']:.4f}")
+    print(f"  delta_3: {agg['delta_3']:.4f}")
     print(f"{'='*60}\n")
 
     return agg
@@ -91,51 +91,48 @@ def evaluate_mde_on_id(
 # Selezione dei layer target per CORES
 # ===========================================================================
 
-def _get_target_layers(model: FastDepthMDE) -> dict:
+def _get_target_layers(model: torch.nn.Module) -> dict:
     """
     Seleziona i layer da encoder e decoder per il monitoraggio CORES.
     Restituisce dict che mappa nomi descrittivi a riferimenti nn.Module.
-
-    Il tap è sulla BatchNorm PRE-attivazione (prima della ReLU), non sul
-    blocco intero: CORES (Tang et al.) definisce la risposta convoluzionale
-    come il segnale grezzo del kernel, comprensivo di valori negativi — un
-    tap post-ReLU (l'output del blocco) azzererebbe sempre la componente
-    negativa (RM-, RF-), rendendo quella metà della formula CORES inerte.
+    Supporta sia FastDepthMDE che METERMDE tramite get_cores_target_layers().
     """
-    targets = {}
+    if hasattr(model, "get_cores_target_layers"):
+        return model.get_cores_target_layers()
 
-    # Encoder layers (pre-attivazione: output BatchNorm delle proiezioni, prima della ReLU)
+    targets = {}
     targets["enc_stage0"] = model.encoder.proj_s0[1]
     targets["enc_stage1"] = model.encoder.proj_s1[1]
     targets["enc_stage2"] = model.encoder.proj_s2[1]
     targets["enc_stage3"] = model.encoder.proj_s3[1]
     targets["enc_stage4"] = model.encoder.proj_bottleneck[1]
-
-    # Decoder layers (pre-attivazione e pre-skip-add: bn_pw del blocco NNConv5)
     targets["dec_up1"] = model.decoder.up1.conv.bn_pw
     targets["dec_up2"] = model.decoder.up2.conv.bn_pw
     targets["dec_up3"] = model.decoder.up3.conv.bn_pw
     targets["dec_up4"] = model.decoder.up4.conv.bn_pw
     targets["dec_up5"] = model.decoder.up5.conv.bn_pw
-
     return targets
 
 
-def _get_target_layers_with_final_conv(model: FastDepthMDE) -> dict:
+def _get_target_layers_with_final_conv(model: torch.nn.Module) -> dict:
     """
-    Come _get_target_layers, ma con un tap aggiuntivo su final_conv (grezzo,
-    PRIMA della ReLU) — serve alla selezione prediction-driven di
-    CORESKernelSelector.select_initial_indices (B2), che ha bisogno
-    dell'output di profondità grezzo per calcolare argmax/argmin.
+    Come _get_target_layers, ma con un tap aggiuntivo su final_conv grezzo.
+    Supporta sia FastDepthMDE che METERMDE.
+    """
+    if hasattr(model, "get_cores_target_layers_with_final_conv"):
+        return model.get_cores_target_layers_with_final_conv()
 
-    Un solo hook-set per entrambi i percorsi di scoring (non-selezionato,
-    Eq. 5, e selezionato/backtracked, Eq. 9): i 5 tap decoder servono a
-    entrambi, quindi un'unica forward pass per batch basta per calcolarli
-    tutti e due, invece di due forward pass separate.
-    """
     targets = _get_target_layers(model)
     targets["final_conv_raw"] = model.decoder.final_conv
     return targets
+
+
+def _get_kernel_selector(model: torch.nn.Module):
+    """Restituisce il selector CORES adatto per FastDepthMDE o METERMDE."""
+    if hasattr(model, "__class__") and model.__class__.__name__ == "METERMDE":
+        from meter import METERKernelSelector
+        return METERKernelSelector(model)
+    return CORESKernelSelector(model)
 
 
 # ===========================================================================
@@ -227,7 +224,7 @@ def evaluate_cores_ood(model, id_val_loader, id_test_loader, ood_test_loader,
     hook_handler.register(model, _get_target_layers_with_final_conv(model))
     scorer = CORESScorer(tau_pos=tau_pos, tau_neg=tau_neg,
                          lambda_1=LAMBDA_1, lambda_2=LAMBDA_2)
-    selector = CORESKernelSelector(model)   # costruito UNA volta, riusato sui 3 split
+    selector = _get_kernel_selector(model)   # costruito UNA volta, riusato sui 3 split
 
     # --- Non-selezionato (Eq. 5, 11 layer) ---
     val_scores = _collect_cores_scores(model, id_val_loader,  scorer, hook_handler,
@@ -260,7 +257,7 @@ def evaluate_cores_ood(model, id_val_loader, id_test_loader, ood_test_loader,
     print(f"  AUROC {ood_metrics['auroc']:.4f} | FPR95 {ood_metrics['fpr95']:.4f}")
     print(f"  Accuracy {binary['accuracy']:.4f} | Precision {binary['precision']:.4f} | "
           f"Recall {binary['recall']:.4f} | F1 {binary['f1']:.4f}")
-    print(f"  TNR su ID-test: {binary['tnr_test']:.4f}  (atteso ≈ {TNR_TARGET:.2f})")
+    print(f"  TNR su ID-test: {binary['tnr_test']:.4f}  (atteso ~ {TNR_TARGET:.2f})")
 
     print("  --- Selezionato/backtracked (Eq. 9, 5 layer decoder, TOPK_FRAC="
           f"{TOPK_FRAC:.2f}) ---")
@@ -269,7 +266,7 @@ def evaluate_cores_ood(model, id_val_loader, id_test_loader, ood_test_loader,
     print(f"  AUROC {ood_metrics_sel['auroc']:.4f} | FPR95 {ood_metrics_sel['fpr95']:.4f}")
     print(f"  Accuracy {binary_sel['accuracy']:.4f} | Precision {binary_sel['precision']:.4f} | "
           f"Recall {binary_sel['recall']:.4f} | F1 {binary_sel['f1']:.4f}")
-    print(f"  TNR su ID-test: {binary_sel['tnr_test']:.4f}  (atteso ≈ {TNR_TARGET:.2f})")
+    print(f"  TNR su ID-test: {binary_sel['tnr_test']:.4f}  (atteso ~ {TNR_TARGET:.2f})")
 
     return {
         **ood_metrics, "id_scores": id_scores, "ood_scores": ood_scores,
@@ -485,26 +482,30 @@ def calibrate_cores_taus(
 # ===========================================================================
 
 def _plot_results(epoch_losses: list, ood_result: dict,
-                  save_dir: str = "./results") -> None:
+                  save_dir: str = "./results",
+                  model_name: str = "FastDepth") -> None:
     """Genera e salva curva di loss, istogrammi score OOD e curva ROC."""
     os.makedirs(save_dir, exist_ok=True)
+    p = f"{model_name.lower()}_"
 
     # --- Training loss ---
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-    ax.axvline(ood_result["threshold"], color="black", linestyle="--", linewidth=2,
-               label=f"Soglia (TNR95 val) = {ood_result['threshold']:.3f}")
     ax.plot(range(1, len(epoch_losses) + 1), epoch_losses,
             marker="o", linewidth=2, color="#2196F3")
     ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("MSE Loss", fontsize=12)
-    ax.set_title("FastDepth Training Loss", fontsize=14)
+    ax.set_ylabel("Loss", fontsize=12)
+    ax.set_title(f"[{model_name}] Training Loss", fontsize=14)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "training_loss.png"), dpi=150)
+    fig.savefig(os.path.join(save_dir, f"{p}training_loss.png"), dpi=150)
+    if model_name.lower() == "fastdepth":
+        fig.savefig(os.path.join(save_dir, "training_loss.png"), dpi=150)
     plt.close(fig)
 
     # --- Distribuzioni score OOD ---
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+    ax.axvline(ood_result["threshold"], color="black", linestyle="--", linewidth=2,
+               label=f"Soglia (TNR95 val) = {ood_result['threshold']:.3f}")
     ax.hist(ood_result["id_scores"], bins=50, alpha=0.6,
             label="ID (NYU)", color="#4CAF50", density=True)
     ax.hist(ood_result["ood_scores"], bins=50, alpha=0.6,
@@ -512,14 +513,16 @@ def _plot_results(epoch_losses: list, ood_result: dict,
     ax.set_xlabel("CORES Score", fontsize=12)
     ax.set_ylabel("Density", fontsize=12)
     ax.set_title(
-        f"OOD Score Distributions  |  AUROC={ood_result['auroc']:.3f}  "
+        f"[{model_name}] OOD Score Distributions  |  AUROC={ood_result['auroc']:.3f}  "
         f"FPR95={ood_result['fpr95']:.3f}",
         fontsize=13,
     )
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "ood_scores.png"), dpi=150)
+    fig.savefig(os.path.join(save_dir, f"{p}ood_scores.png"), dpi=150)
+    if model_name.lower() == "fastdepth":
+        fig.savefig(os.path.join(save_dir, "ood_scores.png"), dpi=150)
     plt.close(fig)
 
     # --- Curva ROC ---
@@ -539,102 +542,116 @@ def _plot_results(epoch_losses: list, ood_result: dict,
     ax.plot([0, 1], [0, 1], "--", color="grey", alpha=0.5)
     ax.set_xlabel("FPR", fontsize=12)
     ax.set_ylabel("TPR", fontsize=12)
-    ax.set_title("ROC Curve — CORES OOD Detection", fontsize=14)
+    ax.set_title(f"[{model_name}] ROC Curve — CORES OOD Detection", fontsize=14)
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "roc_curve.png"), dpi=150)
+    fig.savefig(os.path.join(save_dir, f"{p}roc_curve.png"), dpi=150)
+    if model_name.lower() == "fastdepth":
+        fig.savefig(os.path.join(save_dir, "roc_curve.png"), dpi=150)
     plt.close(fig)
 
-    print(f"Plots saved to: {save_dir}/")
+    print(f"Plots saved to: {save_dir}/ ({p}*)")
 
 
 # ===========================================================================
 # Orchestrazione completa
 # ===========================================================================
 
-def run_full_experiment() -> None:
+def run_full_experiment(model_type: str = "meter", epochs: int = EPOCHS,
+                        skip_ablation: bool = False) -> None:
     """
-    Orchestra l'esperimento completo:
+    Orchestra l'esperimento completo per il modello specificato:
 
         1. Fissa seed per riproducibilità
         2. Costruisce i data loader  (NYU ID + KITTI OOD)
-        3. Istanzia il modello FastDepth
+        3. Istanzia il modello scelto (METERMDE o FastDepthMDE)
         4. Addestra su NYU Depth V2  (ID, indoor)
         5. Valuta accuratezza MDE    sul test set ID
         6. Misura latenza di inferenza GPU
-        7. Calibra TAU_POS/TAU_NEG   (rumore Gaussiano/uniforme, Sez. 5.1)
+        7. Calibra TAU_POS/TAU_NEG   su id_val
         8. Valuta OOD detection      (CORES) su ID vs OOD
-        9. Ablation study CORES      (per-layer, gruppi, cumulativa)
-        10. Genera e salva i grafici
+        9. Ablation study CORES      (opzionale via skip_ablation)
+        10. Genera e salva i grafici dedicati
     """
     set_seed(42)
 
     # 1. Dati
-    print("\n[1/8] Building data loaders ...")
+    print("\n[1/8] Building data loaders ...", flush=True)
     train_loader, id_val_loader, id_test_loader, ood_test_loader = get_dataloaders()
 
     # 2. Modello
-    print("[2/8] Instantiating FastDepth ...")
-    model = FastDepthMDE(pretrained_encoder=True)
+    if model_type.lower() in ("meter", "m"):
+        from meter import METERMDE
+        model_name = "METER"
+        print("[2/8] Instantiating METER (Mobile Vision Transformer) ...", flush=True)
+        model = METERMDE()
+    else:
+        model_name = "FastDepth"
+        print("[2/8] Instantiating FastDepth (MobileNetV2 + NNConv5) ...", flush=True)
+        model = FastDepthMDE(pretrained_encoder=True)
+
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"       Total parameters: {total_params:,}")
+    print(f"       Model: {model_name}  |  Total parameters: {total_params:,}", flush=True)
 
     # 3. Addestramento
-    print("[3/8] Training on NYU Depth V2 (ID) ...")
-    epoch_losses = train_fastdepth(model, train_loader)
+    print(f"[3/8] Training {model_name} on NYU Depth V2 (ID) ...", flush=True)
+    from train import train_model
+    epoch_losses = train_model(model, train_loader, model_name=model_name, epochs=epochs)
 
     # 4. Valutazione MDE
-    print("[4/8] Evaluating MDE on ID test set ...")
+    print(f"[4/8] Evaluating {model_name} MDE on ID test set ...", flush=True)
     mde_metrics = evaluate_mde_on_id(model, id_test_loader)
 
     # 5. Latenza di inferenza
-    print("[5/8] Measuring GPU inference latency ...")
+    print(f"[5/8] Measuring GPU inference latency for {model_name} ...", flush=True)
     sample_input = torch.randn(1, 3, *IMAGE_SIZE).to(DEVICE)
     latency = measure_inference_time_gpu(model, sample_input)
     print(f"       Inference latency: {latency:.2f} ms  "
-          f"({1000.0/latency:.1f} FPS)")
+          f"({1000.0/latency:.1f} FPS)", flush=True)
 
-    # 6. Calibrazione TAU_POS/TAU_NEG (deve avvenire DOPO il training, sul
-    #    modello addestrato — vedi calibrate_cores_taus per il perché, e
-    #    SOLO su id_val, mai su id_test/ood_test)
-    print("[6/8] Calibrating CORES TAU_POS/TAU_NEG on trained model ...")
+    # 6. Calibrazione TAU_POS/TAU_NEG
+    print(f"[6/8] Calibrating CORES TAU_POS/TAU_NEG on trained {model_name} ...", flush=True)
     tau_pos, tau_neg, tau_diagnostics = calibrate_cores_taus(model, id_val_loader)
     if isinstance(tau_pos, dict):
         avg_tp = float(np.mean(list(tau_pos.values())))
         avg_tn = float(np.mean(list(tau_neg.values())))
         print(f"       Calibrated per-layer: avg TAU_POS={avg_tp:.4f}  avg TAU_NEG={avg_tn:.4f}  "
-              f"({len(tau_pos)} layers)")
+              f"({len(tau_pos)} layers)", flush=True)
     else:
         print(f"       Calibrated: TAU_POS={tau_pos:.4f}  TAU_NEG={tau_neg:.4f}  "
-              f"(config.py defaults: {TAU_POS}/{TAU_NEG})")
+              f"(config.py defaults: {TAU_POS}/{TAU_NEG})", flush=True)
 
     # 7. OOD Detection
-    print("[7/8] Evaluating CORES OOD detection ...")
+    print(f"[7/8] Evaluating CORES OOD detection for {model_name} ...", flush=True)
     ood_result = evaluate_cores_ood(model, id_val_loader, id_test_loader, ood_test_loader,
                                     tau_pos=tau_pos, tau_neg=tau_neg)
 
     # 8. Ablation study CORES
-    print("[8/8] Running CORES ablation study ...")
-    ablation_results = run_ablation_study(
-        model, id_test_loader, ood_test_loader,
-    )
+    if not skip_ablation:
+        print(f"[8/8] Running CORES ablation study for {model_name} ...", flush=True)
+        ablation_results = run_ablation_study(
+            model, id_test_loader, ood_test_loader, prefix=model_name.lower(),
+        )
+    else:
+        print(f"[8/8] Skipping CORES ablation study as requested (--skip-ablation).", flush=True)
 
     # 9. Grafici
-    _plot_results(epoch_losses, ood_result )
+    _plot_results(epoch_losses, ood_result, model_name=model_name)
     
     # --- Riepilogo ---
     print(f"\n{'='*60}")
-    print("  EXPERIMENT SUMMARY")
+    print(f"  EXPERIMENT SUMMARY — {model_name.upper()}")
     print(f"{'='*60}")
+    print(f"  Model          : {model_name}")
     print(f"  Device         : {DEVICE}")
     print(f"  Parameters     : {total_params:,}")
-    print(f"  Epochs         : {EPOCHS}")
+    print(f"  Epochs         : {epochs}")
     print(f"  Final Train Loss: {epoch_losses[-1]:.6f}")
     print(f"  MDE AbsRel     : {mde_metrics['abs_rel']:.4f}")
     print(f"  MDE RMSE       : {mde_metrics['rmse']:.4f}")
-    print(f"  MDE δ₁         : {mde_metrics['delta_1']:.4f}")
-    print(f"  Latency        : {latency:.2f} ms")
+    print(f"  MDE delta_1    : {mde_metrics['delta_1']:.4f}")
+    print(f"  Latency        : {latency:.2f} ms ({1000.0/latency:.1f} FPS)")
     print(f"  AUROC (non-sel.): {ood_result['auroc']:.4f}")
     print(f"  FPR95 (non-sel.): {ood_result['fpr95']:.4f}")
     print(f"  AUROC (selected): {ood_result['selected']['auroc']:.4f}")

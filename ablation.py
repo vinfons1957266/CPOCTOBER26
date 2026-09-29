@@ -66,14 +66,16 @@ def _collect_scores(
     return np.concatenate(scores_list)
 
 
-def _all_target_layers(model: FastDepthMDE) -> OrderedDict:
+def _all_target_layers(model: nn.Module) -> OrderedDict:
     """
-    Restituisce tutti gli 11 layer monitorabili (6 enc + 5 dec), ordinati.
+    Restituisce tutti i layer monitorabili (enc + dec), ordinati.
 
     Tap pre-attivazione (BatchNorm prima della ReLU) — deve restare
-    sincronizzato con evaluate.py::_get_target_layers(). Vedi lì per il
-    motivo (RM-/RF- sarebbero sempre nulli su un tap post-ReLU).
+    sincronizzato con evaluate.py::_get_target_layers().
     """
+    if hasattr(model, "get_cores_target_layers"):
+        return OrderedDict(model.get_cores_target_layers())
+
     layers = OrderedDict()
     layers["enc_stage0"] = model.encoder.proj_s0[1]
     layers["enc_stage1"] = model.encoder.proj_s1[1]
@@ -368,9 +370,11 @@ def _plot_ablation(
     cumulative: dict,
     detailed: dict,
     save_dir: str = "./results",
+    prefix: str = "",
 ) -> None:
     """Genera 4 plot riassuntivi dell'ablation study."""
     os.makedirs(save_dir, exist_ok=True)
+    p = f"{prefix}_" if prefix else ""
 
     layer_names = list(per_layer.keys())
     short_names = [n.replace("enc_stage", "E").replace("dec_up", "D")
@@ -396,7 +400,7 @@ def _plot_ablation(
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
                 f"{val:.3f}", ha="center", va="bottom", fontsize=8)
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "ablation_per_layer_auroc.png"), dpi=150)
+    fig.savefig(os.path.join(save_dir, f"{p}ablation_per_layer_auroc.png"), dpi=150)
     plt.close(fig)
 
     # ── Plot 2: Confronto gruppi (bar chart orizzontale) ───────────────────
@@ -420,7 +424,7 @@ def _plot_ablation(
     for i, v in enumerate(group_fpr95s):
         axes[1].text(v + 0.01, i, f"{v:.4f}", va="center", fontsize=10)
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "ablation_group_comparison.png"), dpi=150)
+    fig.savefig(os.path.join(save_dir, f"{p}ablation_group_comparison.png"), dpi=150)
     plt.close(fig)
 
     # ── Plot 3: AUROC cumulativo (curva) ───────────────────────────────────
@@ -443,7 +447,7 @@ def _plot_ablation(
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "ablation_cumulative_auroc.png"), dpi=150)
+    fig.savefig(os.path.join(save_dir, f"{p}ablation_cumulative_auroc.png"), dpi=150)
     plt.close(fig)
 
     # ── Plot 4: Componenti CORES dettagliate (RM+ e RF+ ID vs OOD) ────────
@@ -475,10 +479,10 @@ def _plot_ablation(
     axes[1].legend(fontsize=10)
     axes[1].grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "ablation_cores_components.png"), dpi=150)
+    fig.savefig(os.path.join(save_dir, f"{p}ablation_cores_components.png"), dpi=150)
     plt.close(fig)
 
-    print(f"Ablation plots saved to: {save_dir}/")
+    print(f"Ablation plots saved to: {save_dir}/ ({p}*)")
 
 
 # ===========================================================================
@@ -486,10 +490,11 @@ def _plot_ablation(
 # ===========================================================================
 
 def run_ablation_study(
-    model: FastDepthMDE,
+    model: nn.Module,
     id_loader: DataLoader,
     ood_loader: DataLoader,
     save_dir: str = "./results",
+    prefix: str = "",
 ) -> dict:
     """
     Esegue l'ablation study completa su CORES:
@@ -500,16 +505,18 @@ def run_ablation_study(
         4. Detailed components     → RM+/RM-/RF+/RF- per capire *cosa* cambia
 
     Args:
-        model:      FastDepthMDE addestrato
+        model:      modello addestrato (FastDepthMDE o METERMDE)
         id_loader:  DataLoader test ID  (NYU)
         ood_loader: DataLoader test OOD (KITTI)
         save_dir:   cartella per i plot
+        prefix:     prefisso per salvare i plot (es. 'meter')
 
     Returns:
         dict con i risultati di tutte e 4 le analisi
     """
+    label = f" ({prefix.upper()})" if prefix else ""
     print(f"\n{'#'*60}")
-    print("  CORES ABLATION STUDY")
+    print(f"  CORES ABLATION STUDY{label}")
     print(f"{'#'*60}")
 
     per_layer  = cores_per_layer_ablation(model, id_loader, ood_loader)
@@ -517,7 +524,7 @@ def run_ablation_study(
     cumulative = cores_cumulative_ablation(model, id_loader, ood_loader)
     detailed   = cores_detailed_statistics(model, id_loader, ood_loader)
 
-    _plot_ablation(per_layer, group, cumulative, detailed, save_dir)
+    _plot_ablation(per_layer, group, cumulative, detailed, save_dir, prefix=prefix)
 
     print(f"{'#'*60}")
     print("  ABLATION STUDY COMPLETE")

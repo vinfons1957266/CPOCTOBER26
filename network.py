@@ -278,6 +278,27 @@ class FastDepthMDE(nn.Module):
         depth = self.decoder(enc_out, skips)
         return depth
 
+    def get_cores_target_layers(self) -> dict:
+        """Restituisce i layer pre-attivazione (BatchNorm) monitorati da CORES per FastDepth."""
+        targets = {}
+        targets["enc_stage0"] = self.encoder.proj_s0[1]
+        targets["enc_stage1"] = self.encoder.proj_s1[1]
+        targets["enc_stage2"] = self.encoder.proj_s2[1]
+        targets["enc_stage3"] = self.encoder.proj_s3[1]
+        targets["enc_stage4"] = self.encoder.proj_bottleneck[1]
+        targets["dec_up1"] = self.decoder.up1.conv.bn_pw
+        targets["dec_up2"] = self.decoder.up2.conv.bn_pw
+        targets["dec_up3"] = self.decoder.up3.conv.bn_pw
+        targets["dec_up4"] = self.decoder.up4.conv.bn_pw
+        targets["dec_up5"] = self.decoder.up5.conv.bn_pw
+        return targets
+
+    def get_cores_target_layers_with_final_conv(self) -> dict:
+        """Come get_cores_target_layers, ma con tap grezzo su final_conv per il backtracking."""
+        targets = self.get_cores_target_layers()
+        targets["final_conv_raw"] = self.decoder.final_conv
+        return targets
+
 
 # ===========================================================================
 # Forward Hook Handler
