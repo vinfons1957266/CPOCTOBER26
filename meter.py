@@ -482,22 +482,24 @@ class METERKernelSelector:
         self, i_pos_prev: torch.Tensor, i_neg_prev: torch.Tensor,
         weight: torch.Tensor, k_curr: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = i_pos_prev.shape[0]
+        """
+        Singolo passo di backtracking lungo il decoder (CORES Eq. 8, Tang et al.).
+        Per kernel pointwise 1x1, max(K_{i,j,:,:}) = min(K_{i,j,:,:}) = K_{i,j},
+        quindi l'Eq. 8 collassa alla somma sui canali selezionati al passo precedente:
+            pos_scores = sum_{i in I_pos^(l+1)} W[i, j]  -> TopK (largest=True)
+            neg_scores = sum_{i in I_neg^(l+1)} W[i, j]  -> BotK (largest=False)
+        """
         c_out, c_in = weight.shape
         k_curr = max(1, min(k_curr, c_in))
 
         w = weight.detach().to(i_pos_prev.device)
-        w_expanded = w.unsqueeze(0).expand(batch_size, -1, -1)
 
-        idx_pos = i_pos_prev.unsqueeze(2).expand(-1, -1, c_in)
-        sub_pos = w_expanded.gather(1, idx_pos)
-        k_bar = sub_pos.amax(dim=1)
-        _, i_pos_curr = torch.topk(k_bar, k=k_curr, dim=1, largest=True)
+        # Somma per-campione dei pesi delle righe selezionate al passo precedente (Eq. 8)
+        pos_scores = w[i_pos_prev].sum(dim=1)   # (B, c_in)
+        neg_scores = w[i_neg_prev].sum(dim=1)   # (B, c_in)
 
-        idx_neg = i_neg_prev.unsqueeze(2).expand(-1, -1, c_in)
-        sub_neg = w_expanded.gather(1, idx_neg)
-        k_under = sub_neg.amin(dim=1)
-        _, i_neg_curr = torch.topk(k_under, k=k_curr, dim=1, largest=False)
+        _, i_pos_curr = torch.topk(pos_scores, k=k_curr, dim=1, largest=True)
+        _, i_neg_curr = torch.topk(neg_scores, k=k_curr, dim=1, largest=False)
 
         return i_pos_curr, i_neg_curr
 
